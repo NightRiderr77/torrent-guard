@@ -1,139 +1,125 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/NightRiderr77/torrent-guard/main/assets/banner.svg" alt="torrent-guard — normal traffic passes, BitTorrent is dropped at the Xray routing layer" width="100%">
+<img src="https://raw.githubusercontent.com/NightRiderr77/torrent-guard/main/assets/banner.svg" alt="torrent-guard — normal traffic passes, BitTorrent is dropped" width="100%">
 
 <br><br>
 
-<img alt="Python 3.8+" src="https://img.shields.io/badge/Python-3.8%2B-0B0F0B?style=flat-square&logo=python&logoColor=8FD14F">
-<img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-none-0B0F0B?style=flat-square&logo=gnubash&logoColor=8FD14F">
-<img alt="Xray and 3X-UI" src="https://img.shields.io/badge/Xray_%C2%B7_3X--UI-0B0F0B?style=flat-square&logo=v&logoColor=8FD14F">
+<img alt="Python 3.6+" src="https://img.shields.io/badge/Python-3.6%2B-0B0F0B?style=flat-square&logo=python&logoColor=8FD14F">
+<img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-0B0F0B?style=flat-square&logo=gnubash&logoColor=8FD14F">
+<img alt="No login needed" src="https://img.shields.io/badge/panel_login-not_needed-0B0F0B?style=flat-square&logo=keycdn&logoColor=8FD14F">
 <img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-0B0F0B?style=flat-square">
 
 </div>
 
 ---
 
-If you run a VPN, torrent traffic is what gets your IP ranges blacklisted, your abuse inbox filled, and eventually your server cancelled by the provider. So you add the rule everyone adds:
+Stops BitTorrent on a 3X-UI / Xray server.
+
+Most panels already have a rule that looks like it blocks torrents. **Usually it does nothing**, and the panel gives you no hint. This finds out, and fixes it.
+
+## Quick start
+
+SSH into your server and run:
+
+```bash
+curl -O https://raw.githubusercontent.com/NightRiderr77/torrent-guard/main/block-torrents.py
+sudo python3 block-torrents.py
+```
+
+That only looks. It prints what is wrong and exactly what it would change. To actually fix it:
+
+```bash
+sudo python3 block-torrents.py --apply
+```
+
+Changed your mind:
+
+```bash
+sudo python3 block-torrents.py --restore
+```
+
+**No panel username, no password, no API token, no config file.** 3X-UI keeps everything in a local file (`x-ui.db`); running as root on the server is all the access this needs. It finds the file itself.
+
+## How torrents get blocked
+
+In plain terms:
+
+1. **A torrent app announces itself.** The first few bytes of a BitTorrent connection are distinctive — they always look the same.
+2. **Xray reads those first bytes and names the protocol.** This peek is called **sniffing**.
+3. **A routing rule catches anything named `bittorrent`** and sends it to a **blackhole** — an outbound that throws traffic away instead of forwarding it.
+
+The torrent can't reach any peers, so it stalls and gets nowhere. Browsing, streaming and games are unaffected, because they get named something else and follow their normal path.
+
+## Why the usual rule does nothing
+
+Almost everyone has this in their routing config:
 
 ```json
 { "type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked" }
 ```
 
-The panel shows it. It looks right. **It is very easy for that rule to do nothing at all, and nothing in the UI will tell you.**
+It looks right. Two things quietly stop it working.
 
-`torrent-guard` checks the two things that actually decide whether it works, and fixes them.
+### 1. Nobody is reading the bytes
 
-## The two ways it silently fails
+If **sniffing is off** on the inbound, Xray never names anything, so nothing is ever called `bittorrent` and the rule matches nothing — for any traffic, ever. Sniffing is off by default on a lot of inbounds, and the routing page still shows your rule sitting there looking healthy.
 
-### 1. Sniffing is off
+### 2. Another rule grabs the customer first
 
-`protocol` matching is driven by Xray's sniffer. With `"sniffing": {"enabled": false}` on the inbound there is no protocol metadata to match against, so the rule never fires — **for any traffic, ever**. The same applies to `metadataOnly: true`, which skips the payload where the BitTorrent handshake actually lives.
-
-This is the default on plenty of inbounds, and it is invisible: the rule sits in the routing tab looking perfectly healthy.
-
-### 2. The rule is ordered below your user rules
-
-Xray routing is **first-match-wins**. If you route particular customers through particular outbounds — a country exit, a WARP outbound, anything per-user — those rules are matched first. Every client named in one of them is claimed before the torrent rule is ever considered.
+Xray checks rules **top to bottom and stops at the first one that matches**. If you route particular customers through a particular outbound — a country exit, a WARP outbound, anything per-customer — that rule is higher up. Those customers get claimed before the torrent rule is ever reached.
 
 <div align="center">
-<img src="https://raw.githubusercontent.com/NightRiderr77/torrent-guard/main/assets/rule-order.svg" alt="Before: user rules sit above the bittorrent rule so it is never reached. After: the bittorrent rule is first and always applies." width="100%">
+<img src="https://raw.githubusercontent.com/NightRiderr77/torrent-guard/main/assets/rule-order.svg" alt="Before: customer rules sit above the torrent rule so it is never reached. After: the torrent rule is first and always applies." width="100%">
 </div>
 
-Your torrent block silently stops applying to exactly the customers you cared enough about to route specially.
+So the block silently stops applying to exactly the customers you cared enough about to route specially.
 
-## Install
+## What it changes
 
-One file, standard library only. No `pip install`, nothing to build.
+Four things, and nothing else:
 
-```bash
-git clone https://github.com/NightRiderr77/torrent-guard.git
-cd torrent-guard
-cp panels.example.json panels.json   # then fill it in
-```
-
-`panels.json` is gitignored. Keep it that way.
-
-```json
-{
-  "panels": [
-    {
-      "name": "sg1",
-      "host": "panel.example.com",
-      "port": 2053,
-      "web_base_path": "/yourBasePath/",
-      "username": "PANEL_USERNAME",
-      "password": "PANEL_PASSWORD"
-    }
-  ]
-}
-```
-
-Username and password are required — reading and writing routing settings goes through the panel session, not the API token. Add `"api_token"` if your panel wants it for the inbound endpoints.
-
-## Use
-
-```bash
-python3 torrent_guard.py check
-```
-
-Read-only. Touches nothing. Exit code `0` if every panel is clean, `1` if anything is wrong.
-
-```
--- sg1
-   FAIL  sniffing-off  in-443-tcp
-         sniffing is disabled, so no protocol is ever detected and the bittorrent
-         rule cannot match any traffic on this inbound
-         fix: enable sniffing (routeOnly, so the destination is left alone)
-   FAIL  bittorrent-rule-shadowed  routing.rules[4]
-         54 client entries match an earlier rule (from index 1) and are routed
-         before the bittorrent rule is ever reached - those clients can torrent freely
-         fix: move the bittorrent rule above every user-matching rule
-
-0/1 panel(s) blocking torrents correctly.
-```
-
-Then fix it:
-
-```bash
-python3 torrent_guard.py apply --dry-run   # show the changes, save nothing
-python3 torrent_guard.py apply             # actually apply them
-```
-
-Other flags: `--only sg1,sg4` to limit which panels, `--json` for machine-readable output, `--insecure` for self-signed panel certificates, `--config` for a different panel list.
-
-```bash
-python3 torrent_guard.py selftest
-```
-
-Runs the analysis and repair logic against a deliberately broken sample config. No network, no credentials — useful to confirm the tool behaves before you point it at anything real.
-
-## What `apply` changes
-
-Exactly four things, and nothing else:
-
-| | |
+| Change | Why |
 | :-- | :-- |
-| Sniffing | `enabled: true`, `metadataOnly: false`, `routeOnly: true`, `destOverride: [http, tls, quic]` on every inbound |
-| Blackhole | adds `{"tag": "blocked", "protocol": "blackhole"}` if no blackhole outbound exists |
-| The rule | creates it, re-enables it, or repoints it at the blackhole |
-| Order | moves it directly below the `api` rules, above every user-matching rule |
+| Turns on sniffing for every inbound | so torrents can be recognised at all |
+| Adds a `blocked` blackhole outbound, if missing | somewhere to throw the traffic away |
+| Creates / re-enables the torrent rule, pointed at the blackhole | the rule itself |
+| Moves that rule above your customer rules | so it is actually reached |
 
-Your outbounds, your per-user routing assignments and every other rule are left exactly as they were. The previous routing config is written to `backups/<panel>-<timestamp>.json` before anything is saved.
+**Not touched:** your customers, their UUIDs, quotas, expiry dates, usage counters, inbound settings, certificates, or which outbound each customer routes through. It prints the exact before/after before changing anything, and copies `x-ui.db` to a timestamped `.bak` next to itself first.
 
-**`routeOnly: true` is deliberate.** Plain `destOverride` rewrites the connection's destination to whatever domain the sniffer found. If you present a different SNI to the network on purpose, that will break your configs. `routeOnly` gives routing the sniffed information while leaving the destination alone.
+One detail worth knowing: sniffing is enabled with `routeOnly: true`. Without that, sniffing rewrites the connection's destination to whatever domain it detected, which breaks any config that presents a different SNI on purpose. `routeOnly` gives routing the answer and leaves the destination alone.
 
-> **Applying sniffing changes restarts Xray on that panel.** Inbound edits regenerate the config, which drops live connections for a moment. Routing-only changes do not. Run it in a quiet window.
+> **It restarts x-ui at the end**, because inbound changes only take effect on restart. That drops live connections for a second or two. Use `--no-restart` to do it yourself later.
 
-## Limits — read this before you trust it
+## Options
 
-- **Encrypted BitTorrent can evade sniffing.** Clients with protocol encryption (MSE/PE) obscure the handshake. Xray catches the common cases, not every case.
-- **This blocks torrents through your tunnel.** It does not stop someone torrenting outside the VPN, and it is not a copyright enforcement system.
-- **`extras/nft-bittorrent.sh`** closes well-known tracker and DHT ports on the server with nftables. Torrent clients use arbitrary high ports, so it stops very little on its own — it is a second layer, not the control.
-- **Verify after applying.** `check` tells you the configuration is correct. It cannot tell you a particular client is defeated.
+```
+sudo python3 block-torrents.py                  # look only (default)
+sudo python3 block-torrents.py --apply          # fix it
+sudo python3 block-torrents.py --restore        # undo, newest backup
+sudo python3 block-torrents.py --no-restart     # don't restart x-ui
+sudo python3 block-torrents.py --db /path/x-ui.db
+```
 
-## Security
+Safe to run twice — if everything is already correct it says so and exits without touching anything.
 
-Panel credentials live only in your local `panels.json`, which is gitignored. Nothing is sent anywhere except your own panels. `--insecure` disables TLS verification for self-signed panels and prints a warning when used — your panel password crosses that connection, so prefer a real certificate.
+## What it can't do
+
+- **Encrypted torrent traffic can slip past.** Clients with protocol encryption (MSE/PE) hide that opening handshake. This catches the common cases, not every case.
+- **It only covers traffic through your VPN.** It is not a copyright enforcement system.
+- `extras/nft-bittorrent.sh` closes well-known tracker and DHT ports with nftables. Torrent clients use random high ports, so on its own that stops very little — it's a second layer, not the control.
+
+## Optional: checking many panels at once
+
+If you run a fleet and want to audit panels remotely rather than SSH into each one, `torrent_guard.py` does the same job over the panel API. That one **does** need panel credentials, in a local `panels.json` (gitignored — see `panels.example.json`).
+
+```bash
+python3 torrent_guard.py check      # read-only, all panels
+python3 torrent_guard.py apply      # fix them
+python3 torrent_guard.py selftest   # no network, no credentials
+```
+
+Most people should just use `block-torrents.py` on the server.
 
 ## Licence
 
@@ -141,5 +127,5 @@ MIT. See [LICENSE](LICENSE).
 
 <div align="center">
 <br>
-<sub>Built for the <a href="https://pxnstores.lk">PXN Stores LK</a> fleet. Works with any Xray or 3X-UI panel.</sub>
+<sub>Built for the <a href="https://pxnstores.lk">PXN Stores LK</a> fleet. Works with any 3X-UI or Xray panel.</sub>
 </div>
