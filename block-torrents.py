@@ -243,6 +243,58 @@ def restore(db, which=None):
     print("run: x-ui restart")
 
 
+def show_state(db_path):
+    """Print what the server is doing right now, without judging it."""
+    con = sqlite3.connect(db_path)
+    con.row_factory = sqlite3.Row
+    print("Inbounds")
+    for ib in con.execute("select id, tag, remark, port, sniffing from inbounds order by id"):
+        sn = loads(ib["sniffing"], {})
+        if not sn.get("enabled"):
+            state = "NOT inspected - torrents cannot be detected here"
+        elif sn.get("metadataOnly"):
+            state = "headers only - torrents cannot be detected here"
+        else:
+            state = "inspected" + ("" if sn.get("routeOnly") else "  (routeOnly is off)")
+        print("  [{0}] port {1:<6} {2:<22} {3}".format(
+            ib["id"], ib["port"], (ib["remark"] or ib["tag"] or "")[:22], state))
+
+    row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    con.close()
+    if row is None:
+        print("")
+        print("Routing: none saved yet.")
+        return
+    xray = json.loads(row["value"])
+    holes = [str(o.get("tag")) for o in xray.get("outbounds", [])
+             if str(o.get("protocol", "")).lower() == "blackhole"]
+    print("")
+    print("Routing rules, in the order Xray checks them")
+    hit = False
+    for i, r in enumerate(xray.get("routing", {}).get("rules", [])):
+        users = rule_users(r)
+        if is_api(r):
+            what = "panel api"
+        elif is_bt(r):
+            what = "TORRENTS -> {0}".format(r.get("outboundTag"))
+        elif users:
+            what = "{0} customers -> {1}".format(len(users), r.get("outboundTag"))
+        else:
+            what = "{0} -> {1}".format(
+                ",".join(r.get("ip") or r.get("domain") or ["other"])[:30], r.get("outboundTag"))
+        note = ""
+        if is_bt(r):
+            note = "  <-- torrent rule"
+            if str(r.get("outboundTag")) not in holes:
+                note += " (NOT a blackhole - it is being forwarded)"
+            hit = True
+        elif users and not hit:
+            note = "  <-- these customers never reach the torrent rule"
+        print("  [{0}] {1}{2}".format(i, what, note))
+    if not hit:
+        print("  (no torrent rule present)")
+
+
 def show_diff(p):
     """Spell out the exact edits, so nothing is applied that was not shown first."""
     print("\nExact changes:")
@@ -279,6 +331,8 @@ def main():
         prog="block-torrents",
         description="Stop BitTorrent on a 3X-UI server. Run on the server, as root.")
     ap.add_argument("--apply", action="store_true", help="make the changes (default: just look)")
+    ap.add_argument("--show", action="store_true",
+                    help="print the current sniffing and rule order, then exit")
     ap.add_argument("--db", help="path to x-ui.db if it is somewhere unusual")
     ap.add_argument("--no-restart", action="store_true", help="do not restart x-ui afterwards")
     ap.add_argument("--restore", nargs="?", const=True, metavar="BACKUP",
@@ -288,6 +342,9 @@ def main():
     args = ap.parse_args()
 
     db = find_db(args.db)
+    if args.show:
+        show_state(db)
+        return 0
     if args.restore:
         restore(db, None if args.restore is True else args.restore)
         return 0

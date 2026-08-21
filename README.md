@@ -95,6 +95,7 @@ One detail worth knowing: sniffing is enabled with `routeOnly: true`. Without th
 
 ```
 sudo python3 block-torrents.py                  # look only (default)
+sudo python3 block-torrents.py --show           # print current state, no verdict
 sudo python3 block-torrents.py --apply          # fix it
 sudo python3 block-torrents.py --restore        # undo, newest backup
 sudo python3 block-torrents.py --no-restart     # don't restart x-ui
