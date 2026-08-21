@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy to panels.json and fill in. panels.json is gitignored - never commit real credentials.",
+  "panels": [
+    {
+      "name": "sg1",
+      "host": "panel.example.com",
+      "port": 2053,
+      "web_base_path": "/yourBasePath/",
+      "username": "PANEL_USERNAME",
+      "password": "PANEL_PASSWORD",
+      "api_token": "OPTIONAL_3XUI_API_TOKEN"
+    }
+  ]
+}

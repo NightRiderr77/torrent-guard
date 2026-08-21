@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 500" width="1040" height="500"
+     role="img" aria-label="Xray routing is first-match-wins. Before: user rules sit above the bittorrent rule, so it is never reached. After: the bittorrent rule sits first and always applies.">
+  <title>Rule order decides whether the bittorrent rule runs</title>
+  <defs><style>.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", "DejaVu Sans Mono", Menlo, Consolas, monospace; }</style>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4F6140"/></marker>
+  </defs>
+  <rect width="1040" height="500" fill="#060806"/>
+  <text class="mono" x="520.0" y="32" fill="#4F6140" font-size="12" letter-spacing="4" text-anchor="middle">XRAY ROUTING IS FIRST-MATCH-WINS</text>
+  <text class="mono" x="60" y="62" fill="#8B4A4A" font-size="15" font-weight="700" letter-spacing="2.5">BEFORE</text>
+  <text class="mono" x="60" y="86" fill="#4F6140" font-size="12">the rule is present, and inert</text>
+  <rect x="60" y="116" width="360" height="46" rx="8" fill="#0E140D" stroke="#22301B"/>
+  <text class="mono" x="74" y="144" fill="#4F6140" font-size="12">[0]</text>
+  <text class="mono" x="106" y="144" fill="#5A6B4A" font-size="13.5" font-weight="700">api</text>
+  <text class="mono" x="406" y="144" fill="#5A6B4A" font-size="12" text-anchor="end" opacity=".85">inboundTag: api</text>
+  <rect x="60" y="170" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="74" y="198" fill="#4F6140" font-size="12">[1]</text>
+  <text class="mono" x="106" y="198" fill="#9CA893" font-size="13.5" font-weight="700">lk</text>
+  <text class="mono" x="406" y="198" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x28</text>
+  <rect x="60" y="224" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="74" y="252" fill="#4F6140" font-size="12">[2]</text>
+  <text class="mono" x="106" y="252" fill="#9CA893" font-size="13.5" font-weight="700">warp</text>
+  <text class="mono" x="406" y="252" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x26</text>
+  <rect x="60" y="278" width="360" height="46" rx="8" fill="#0E140D" stroke="#22301B"/>
+  <text class="mono" x="74" y="306" fill="#4F6140" font-size="12">[3]</text>
+  <text class="mono" x="106" y="306" fill="#5A6B4A" font-size="13.5" font-weight="700">blocked</text>
+  <text class="mono" x="406" y="306" fill="#5A6B4A" font-size="12" text-anchor="end" opacity=".85">ip: geoip:private</text>
+  <rect x="60" y="332" width="360" height="46" rx="8" fill="#1A0E0E" stroke="#4A2020" stroke-width="2"/>
+  <text class="mono" x="74" y="360" fill="#4F6140" font-size="12">[4]</text>
+  <text class="mono" x="106" y="360" fill="#8B4A4A" font-size="13.5" font-weight="700">blocked</text>
+  <text class="mono" x="406" y="360" fill="#8B4A4A" font-size="12" text-anchor="end" opacity=".85">protocol: bittorrent</text>
+  <line x1="70" y1="355.0" x2="410" y2="355.0" stroke="#8B4A4A" stroke-width="1.4"/>
+  <rect x="60" y="386" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="74" y="414" fill="#4F6140" font-size="12">[5]</text>
+  <text class="mono" x="106" y="414" fill="#9CA893" font-size="13.5" font-weight="700">us</text>
+  <text class="mono" x="406" y="414" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x2</text>
+  <text class="mono" x="60" y="470" fill="#8B4A4A" font-size="12">54 clients match [1] or [2] first, so rule [4]</text>
+  <text class="mono" x="60" y="489" fill="#8B4A4A" font-size="12">is dead code for every one of them.</text>
+  <text class="mono" x="620" y="62" fill="#8FD14F" font-size="15" font-weight="700" letter-spacing="2.5">AFTER</text>
+  <text class="mono" x="620" y="86" fill="#4F6140" font-size="12">same rules, one moved</text>
+  <rect x="620" y="116" width="360" height="46" rx="8" fill="#0E140D" stroke="#22301B"/>
+  <text class="mono" x="634" y="144" fill="#4F6140" font-size="12">[0]</text>
+  <text class="mono" x="666" y="144" fill="#5A6B4A" font-size="13.5" font-weight="700">api</text>
+  <text class="mono" x="966" y="144" fill="#5A6B4A" font-size="12" text-anchor="end" opacity=".85">inboundTag: api</text>
+  <rect x="620" y="170" width="360" height="46" rx="8" fill="#101A0C" stroke="#4E7A2A" stroke-width="2"/>
+  <text class="mono" x="634" y="198" fill="#4F6140" font-size="12">[1]</text>
+  <text class="mono" x="666" y="198" fill="#C7F76E" font-size="13.5" font-weight="700">blocked</text>
+  <text class="mono" x="966" y="198" fill="#C7F76E" font-size="12" text-anchor="end" opacity=".85">protocol: bittorrent</text>
+  <rect x="620" y="224" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="634" y="252" fill="#4F6140" font-size="12">[2]</text>
+  <text class="mono" x="666" y="252" fill="#9CA893" font-size="13.5" font-weight="700">lk</text>
+  <text class="mono" x="966" y="252" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x28</text>
+  <rect x="620" y="278" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="634" y="306" fill="#4F6140" font-size="12">[3]</text>
+  <text class="mono" x="666" y="306" fill="#9CA893" font-size="13.5" font-weight="700">warp</text>
+  <text class="mono" x="966" y="306" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x26</text>
+  <rect x="620" y="332" width="360" height="46" rx="8" fill="#0E140D" stroke="#22301B"/>
+  <text class="mono" x="634" y="360" fill="#4F6140" font-size="12">[4]</text>
+  <text class="mono" x="666" y="360" fill="#5A6B4A" font-size="13.5" font-weight="700">blocked</text>
+  <text class="mono" x="966" y="360" fill="#5A6B4A" font-size="12" text-anchor="end" opacity=".85">ip: geoip:private</text>
+  <rect x="620" y="386" width="360" height="46" rx="8" fill="#12180F" stroke="#2A3A22"/>
+  <text class="mono" x="634" y="414" fill="#4F6140" font-size="12">[5]</text>
+  <text class="mono" x="666" y="414" fill="#9CA893" font-size="13.5" font-weight="700">us</text>
+  <text class="mono" x="966" y="414" fill="#9CA893" font-size="12" text-anchor="end" opacity=".85">user x2</text>
+  <text class="mono" x="620" y="470" fill="#8FD14F" font-size="12">every client is tested against [1] before any</text>
+  <text class="mono" x="620" y="489" fill="#8FD14F" font-size="12">user rule can claim it.</text>
+  <line x1="465" y1="247.0" x2="600" y2="247.0" stroke="#4F6140" stroke-width="2" marker-end="url(#arw)"/>
+  <text class="mono" x="532" y="235.0" fill="#4F6140" font-size="11" letter-spacing="2" text-anchor="middle">apply</text>
+</svg>

@@ -1,0 +1,9 @@
+# real panel credentials - never commit
+panels.json
+# routing backups written by `apply`
+backups/
+# local scratch
+.preview.html
+*.png
+__pycache__/
+*.pyc
