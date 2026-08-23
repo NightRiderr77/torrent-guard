@@ -20,7 +20,7 @@ How the block works, in short:
       2. the rule is checked before any rule that matches your customers,
          because Xray stops at the first rule that matches.
 
-Standard library only. Python 3.6+.
+Standard library only. Python 3.7+.
 """
 import argparse
 import copy
@@ -33,7 +33,7 @@ import sqlite3
 import subprocess
 import sys
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DB_CANDIDATES = [
     "/etc/x-ui/x-ui.db",
@@ -189,12 +189,69 @@ def plan(db_path):
             "routing_note": None}
 
 
+def _service(action):
+    """Run x-ui start/stop/restart, whichever mechanism this box uses."""
+    for cmd in (["x-ui", action], ["systemctl", action, "x-ui"]):
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if r.returncode == 0:
+                return " ".join(cmd)
+        except (OSError, FileNotFoundError):
+            continue
+    return None
+
+
+def integrity(path):
+    """(ok, detail). Never assume a database file is usable just because it exists."""
+    try:
+        con = sqlite3.connect(path)
+        try:
+            result = con.execute("pragma integrity_check").fetchone()[0]
+            tables = [r[0] for r in con.execute(
+                "select name from sqlite_master where type='table'")]
+        finally:
+            con.close()
+    except Exception as e:
+        return False, "unreadable ({0})".format(e)
+    if result != "ok":
+        return False, result
+    if "inbounds" not in tables or "settings" not in tables:
+        return False, "not an x-ui database (missing core tables)"
+    return True, "ok"
+
+
+def snapshot(db, dest):
+    """Consistent copy of a LIVE SQLite database.
+
+    A plain file copy is not safe here. If x-ui writes while the bytes are being
+    read, the copy is torn - and a torn backup is worse than none, because it
+    still looks restorable. SQLite's own backup API takes a proper snapshot.
+    """
+    src = sqlite3.connect(db)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    ok, detail = integrity(dest)
+    if not ok:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        raise RuntimeError("backup failed its own integrity check ({0}); "
+                           "nothing was changed".format(detail))
+    return dest
+
+
 def apply_plan(p, do_restart=True):
     db = p["db"]
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     bak = "{0}.torrentguard-{1}.bak".format(db, stamp)
-    shutil.copy2(db, bak)
-    print("  backup saved: {0}".format(bak))
+    snapshot(db, bak)
+    print("  backup saved and verified: {0}".format(bak))
 
     con = sqlite3.connect(db)
     try:
@@ -225,22 +282,53 @@ def apply_plan(p, do_restart=True):
 
 def restore(db, which=None):
     baks = sorted(glob.glob(db + ".torrentguard-*.bak"))
-    if not baks:
+    if not baks and not which:
         sys.exit("no backup found next to {0}".format(db))
-    src = which or baks[-1]
+    src = which if which and which is not True else baks[-1]
     if not os.path.exists(src):
         sys.exit("not found: {0}".format(src))
+
+    # Check the backup BEFORE overwriting anything. Writing a damaged file over a
+    # working database is how a reversible change becomes an outage.
+    ok, detail = integrity(src)
+    if not ok:
+        sys.exit("Refusing to restore: {0} is damaged ({1}).\n"
+                 "Your current database has NOT been touched.\n"
+                 "Other backups available:\n  {2}".format(
+                     src, detail, "\n  ".join(baks) or "(none)"))
+    print("backup checks out: {0}".format(src))
+
+    # x-ui holds the file open, and any -wal / -shm left behind by the running
+    # database would be replayed on top of the restored file and corrupt it.
+    stopped = _service("stop")
+    print("stopped x-ui" if stopped else "could not stop x-ui - continuing, but "
+          "stop it yourself if this fails")
+
+    safety = "{0}.before-restore-{1}".format(
+        db, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    try:
+        shutil.copy2(db, safety)
+        print("current database kept at: {0}".format(safety))
+    except OSError:
+        safety = None
+
     shutil.copy2(src, db)
+    for side in ("-wal", "-shm", "-journal"):
+        if os.path.exists(db + side):
+            os.remove(db + side)
+            print("removed stale {0}{1}".format(os.path.basename(db), side))
+
+    ok, detail = integrity(db)
+    if not ok:
+        if safety:
+            shutil.copy2(safety, db)
+            print("restore produced a damaged database ({0}); put the previous one "
+                  "back".format(detail))
+        _service("start")
+        sys.exit(1)
+
     print("restored {0} -> {1}".format(src, db))
-    for cmd in (["x-ui", "restart"], ["systemctl", "restart", "x-ui"]):
-        try:
-            if subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.STDOUT).returncode == 0:
-                print("x-ui restarted")
-                return
-        except (OSError, FileNotFoundError):
-            continue
-    print("run: x-ui restart")
+    print("started x-ui with: {0}".format(_service("start") or "(run: x-ui start)"))
 
 
 def show_state(db_path):

@@ -89,6 +89,8 @@ Four things, and nothing else:
 
 One detail worth knowing: sniffing is enabled with `routeOnly: true`. Without that, sniffing rewrites the connection's destination to whatever domain it detected, which breaks any config that presents a different SNI on purpose. `routeOnly` gives routing the answer and leaves the destination alone.
 
+Backups are taken with SQLite's own backup API and verified before `apply` writes anything, and `--restore` checks a backup's integrity, stops x-ui and clears stale `-wal`/`-shm` files before putting it back. A backup that fails its check is refused rather than written over a working database.
+
 > **It restarts x-ui at the end**, because inbound changes only take effect on restart. That drops live connections for a second or two. Use `--no-restart` to do it yourself later.
 
 ## Options
