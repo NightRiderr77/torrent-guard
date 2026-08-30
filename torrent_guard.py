@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # routeOnly keeps the original destination and uses the sniffed result purely for
 # routing decisions. That matters: plain destOverride rewrites the destination to
@@ -53,10 +53,10 @@ BT_PROTOCOLS = ["bittorrent"]
 # Sniffing only ever names PLAINTEXT BitTorrent over TCP, and that is a small and
 # shrinking share of real torrent traffic. Clients turn on protocol encryption
 # (MSE/PE) by default, so the handshake is a Diffie-Hellman key with no
-# "BitTorrent protocol" string left to match; and most peer traffic is uTP over
-# UDP, which Xray does not content-sniff at all, so a protocol rule can never
-# match it. Verified against Xray 26.1.23 - extras/verify-blocking.py reproduces
-# all of it in about ten seconds.
+# "BitTorrent protocol" string left to match. Most peer traffic is uTP over UDP,
+# and while Xray does carry a uTP sniffer it only matches the ST_SYN packet that
+# opens a connection, with exact header framing - everything after it matches
+# nothing. extras/verify-blocking.py reproduces all of it in ten seconds.
 #
 # Identifying peer traffic is therefore a losing game. What works is cutting off
 # peer DISCOVERY: a client that cannot reach a tracker or the DHT has no peer
@@ -82,10 +82,48 @@ TRACKER_DOMAINS = [
 ]
 DHT_SENTINEL = "domain:router.bittorrent.com"
 
-# strict only: every UDP port except 53 (DNS), 123 (NTP), 443 (QUIC) and
-# 3478-3481 (STUN). This is what finally kills uTP, and it also breaks games and
-# voice chat, which is why it is opt-in.
-UDP_EXCEPT_ESSENTIAL = "1-52,54-122,124-442,444-3477,3482-65535"
+# strict only. Peers listen on random high UDP ports, so there is no list of
+# torrent ports to block - the only thing that kills uTP is to close UDP and open
+# back the few things that genuinely need it.
+ESSENTIAL_UDP_PORTS = "53,123,443,3478-3481,19302-19309"
+
+# Destinations allowed on any UDP port. Voice chat picks a random high port per
+# call, exactly like a torrent peer does, so port rules cannot tell them apart -
+# but the destination can. 66.22.192.0/18 is Discord Inc. (RIPE US-DISCORD1).
+ALLOW_UDP_IPS = ["66.22.192.0/18"]
+
+
+def parse_ports(spec):
+    """'53,3478-3481' -> [(53, 53), (3478, 3481)]"""
+    out = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out.append((int(lo), int(hi)))
+        else:
+            out.append((int(part), int(part)))
+    return out
+
+
+def complement_ports(allowed):
+    """Every port 1-65535 that is NOT allowed, as an Xray port string."""
+    merged = []
+    for lo, hi in sorted(allowed):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append([lo, hi])
+    out, cur = [], 1
+    for lo, hi in merged:
+        if lo > cur:
+            out.append((cur, lo - 1))
+        cur = max(cur, hi + 1)
+    if cur <= 65535:
+        out.append((cur, 65535))
+    return ",".join("{0}-{1}".format(a, b) if a != b else str(a) for a, b in out)
 
 OK, WARN, BAD = "ok", "warn", "bad"
 
@@ -127,16 +165,26 @@ def _is_tracker_domain_rule(rule):
 
 def _is_udp_clamp_rule(rule):
     return (str(rule.get("network") or "").lower() == "udp"
-            and str(rule.get("port") or "") == UDP_EXCEPT_ESSENTIAL)
+            and rule.get("port") and not rule.get("ip")
+            and not rule.get("domain") and not rule.get("protocol"))
+
+
+def _is_udp_allow_rule(rule):
+    """The companion rule that lets voice and video through the clamp."""
+    return (str(rule.get("network") or "").lower() == "udp"
+            and rule.get("ip") and not rule.get("port")
+            and not rule.get("domain") and not rule.get("protocol"))
 
 
 def _is_guard_rule(rule):
     """Any rule this tool owns."""
     return (_is_bt_rule(rule) or _is_discovery_ports_rule(rule)
-            or _is_tracker_domain_rule(rule) or _is_udp_clamp_rule(rule))
+            or _is_tracker_domain_rule(rule) or _is_udp_clamp_rule(rule)
+            or _is_udp_allow_rule(rule))
 
 
-def guard_rules(hole, strict=False):
+def guard_rules(hole, strict=False, allow_ips=None, allow_ports=None,
+                passthrough="direct", clamp_ports=None):
     """The rules that stop torrents, in the order Xray must check them."""
     out = [
         {"type": "field", "protocol": list(BT_PROTOCOLS), "outboundTag": hole,
@@ -146,7 +194,15 @@ def guard_rules(hole, strict=False):
          "enabled": True},
     ]
     if strict:
-        out.append({"type": "field", "network": "udp", "port": UDP_EXCEPT_ESSENTIAL,
+        ips = list(allow_ips if allow_ips is not None else ALLOW_UDP_IPS)
+        ports = allow_ports if allow_ports is not None else ESSENTIAL_UDP_PORTS
+        # The allow rule has to sit ABOVE the clamp and name an outbound, because
+        # Xray stops at the first match and has no "keep looking" verdict.
+        if ips:
+            out.append({"type": "field", "network": "udp", "ip": ips,
+                        "outboundTag": passthrough, "enabled": True})
+        out.append({"type": "field", "network": "udp",
+                    "port": clamp_ports or complement_ports(parse_ports(ports)),
                     "outboundTag": hole, "enabled": True})
     return out
 
@@ -279,7 +335,8 @@ def audit(xray, inbounds, strict=False):
 # --------------------------------------------------------------------------- #
 # Repair
 # --------------------------------------------------------------------------- #
-def repair_xray(xray, strict=False, drop_strict=False):
+def repair_xray(xray, strict=False, drop_strict=False, allow_ips=None,
+                allow_ports=None):
     """Return (new_xray, [descriptions of what changed]). The input is not mutated."""
     x = copy.deepcopy(xray)
     changes = []
@@ -307,6 +364,20 @@ def repair_xray(xray, strict=False, drop_strict=False):
     have_ports = any(_is_discovery_ports_rule(r) for _, r in existing)
     have_domains = any(_is_tracker_domain_rule(r) for _, r in existing)
     have_clamp = any(_is_udp_clamp_rule(r) for _, r in existing)
+
+    # Panel edits win unless this run names a replacement: the rules are visible
+    # in the panel precisely so an operator can widen the allowlist there.
+    if allow_ips is None:
+        prior = [r for _, r in existing if _is_udp_allow_rule(r)]
+        allow_ips = prior[0].get("ip") if prior else None
+    clamp_ports = None
+    if allow_ports is None:
+        prior = [r for _, r in existing if _is_udp_clamp_rule(r)]
+        clamp_ports = str(prior[0].get("port")) if prior else None
+
+    passthrough = next((str(o.get("tag")) for o in x["outbounds"]
+                        if str(o.get("protocol", "")).lower() != "blackhole"
+                        and o.get("tag")), "direct")
 
     for i, _ in reversed(existing):
         rules.pop(i)
@@ -342,7 +413,8 @@ def repair_xray(xray, strict=False, drop_strict=False):
     if first_guard is not None and first_guard != insert_at:
         changes.append("moved the torrent rules from index {0} to {1}, above the user "
                        "rules".format(first_guard, insert_at))
-    for offset, rule in enumerate(guard_rules(hole, want_clamp)):
+    for offset, rule in enumerate(guard_rules(hole, want_clamp, allow_ips, allow_ports,
+                                              passthrough, clamp_ports)):
         rules.insert(insert_at + offset, rule)
     return x, changes
 
@@ -575,7 +647,8 @@ def run(args):
             if args.command == "apply" and entry["findings"]:
                 entry["backup"] = backup(args.backup_dir, entry["panel"], xray)
                 new_xray, changes = repair_xray(
-                    xray, strict=args.strict, drop_strict=args.no_strict)
+                    xray, strict=args.strict, drop_strict=args.no_strict,
+                    allow_ips=allow_ips, allow_ports=args.allow_udp_port)
                 if changes:
                     if not args.dry_run:
                         panel.put_xray(new_xray)
@@ -698,6 +771,25 @@ def selftest():
     _strict = repair_xray(SAMPLE["xray"], strict=True)[0]
     check("strict adds the UDP clamp",
           any(_is_udp_clamp_rule(r) for r in _strict["routing"]["rules"]))
+    check("strict lets Discord voice past the clamp",
+          any(_is_udp_allow_rule(r) and ALLOW_UDP_IPS[0] in (r.get("ip") or [])
+              for r in _strict["routing"]["rules"]))
+    check("the allow rule sits above the clamp",
+          next(i for i, r in enumerate(_strict["routing"]["rules"]) if _is_udp_allow_rule(r))
+          < next(i for i, r in enumerate(_strict["routing"]["rules"])
+                 if _is_udp_clamp_rule(r)))
+    _c = complement_ports(parse_ports(ESSENTIAL_UDP_PORTS))
+    check("the clamp leaves DNS, NTP, QUIC and STUN open",
+          not any(lo <= p <= hi for p in (53, 123, 443, 3478, 19302)
+                  for lo, hi in parse_ports(_c)))
+    check("the clamp closes the ports peers actually use",
+          all(any(lo <= p <= hi for lo, hi in parse_ports(_c))
+              for p in (6881, 50001, 54321, 1024)))
+    check("a hand-widened allowlist survives a later run",
+          ["1.2.3.0/24"] == next(r["ip"] for r in repair_xray(
+              repair_xray(SAMPLE["xray"], strict=True,
+                          allow_ips=["1.2.3.0/24"])[0])[0]["routing"]["rules"]
+              if _is_udp_allow_rule(r)))
     check("strict survives a later plain run",
           any(_is_udp_clamp_rule(r) for r in repair_xray(_strict)[0]["routing"]["rules"]))
     check("no-strict removes the clamp",
@@ -753,6 +845,12 @@ def main():
                          "what stops uTP, but it breaks games and voice chat. Stays "
                          "on once set")
     ap.add_argument("--no-strict", action="store_true", help="remove the UDP clamp")
+    ap.add_argument("--allow-udp-ip", metavar="CIDR,...",
+                    help="destinations allowed on any UDP port under --strict "
+                         "(default {0})".format(",".join(ALLOW_UDP_IPS)))
+    ap.add_argument("--allow-udp-port", metavar="PORTS",
+                    help="UDP ports allowed to every destination under --strict "
+                         "(default {0})".format(ESSENTIAL_UDP_PORTS))
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--insecure", action="store_true",
                     help="skip TLS verification (self-signed panels)")
@@ -761,6 +859,9 @@ def main():
     ap.add_argument("-V", "--version", action="version",
                     version="torrent-guard {0}".format(__version__))
     args = ap.parse_args()
+    allow_ips = ([x.strip() for x in args.allow_udp_ip.split(",") if x.strip()]
+                 if args.allow_udp_ip else None)
+
     if args.command == "selftest":
         sys.exit(selftest())
     sys.exit(run(args))

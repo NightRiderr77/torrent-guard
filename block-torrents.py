@@ -33,7 +33,7 @@ import sqlite3
 import subprocess
 import sys
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 DB_CANDIDATES = [
     "/etc/x-ui/x-ui.db",
@@ -60,11 +60,13 @@ SNIFFING = {
 #   * uTorrent, qBittorrent and Transmission turn on protocol encryption (MSE/PE)
 #     by default. The first bytes are then a Diffie-Hellman key - indistinguishable
 #     from noise - so there is no "BitTorrent protocol" string left to match.
-#   * Most peer traffic is uTP over UDP, and Xray does not run content sniffers on
-#     UDP at all. A `protocol: bittorrent` rule can never match a UDP packet.
+#   * Most peer traffic is uTP over UDP. Xray does carry a uTP sniffer, but it
+#     only matches the ST_SYN packet that opens a connection, and only with exact
+#     header framing. Everything after it - all the actual data - matches nothing.
+#     On a live server with the rule in place and sniffing on, torrents ran at
+#     full speed.
 #
-# Verified against Xray 26.1.23 - see extras/verify-blocking.py, which reproduces
-# all of this locally in about ten seconds.
+# See extras/verify-blocking.py, which reproduces all of this in ten seconds.
 #
 # So identifying peer traffic is a losing game. What actually works is cutting off
 # peer DISCOVERY: a client that cannot reach a tracker or the DHT has no peer list,
@@ -93,11 +95,57 @@ TRACKER_DOMAINS = [
 ]
 DHT_SENTINEL = "domain:router.bittorrent.com"
 
-# --strict only. Every UDP port EXCEPT 53 (DNS), 123 (NTP), 443 (QUIC) and
-# 3478-3481 (STUN). This is what finally kills uTP, because peers listen on random
-# high ports and there is no list to block. It also breaks games, voice chat and
-# anything else that needs arbitrary UDP, which is why it is off by default.
-UDP_EXCEPT_ESSENTIAL = "1-52,54-122,124-442,444-3477,3482-65535"
+# --strict only. Peers listen on random high UDP ports, so there is no list of
+# torrent ports to block - the only thing that kills uTP is to close UDP and open
+# back the few things that genuinely need it.
+#
+# Ports: DNS, NTP, QUIC, STUN/TURN, and Google's STUN range (WebRTC, which Discord
+# and Meet use to find a path).
+ESSENTIAL_UDP_PORTS = "53,123,443,3478-3481,19302-19309"
+
+# Destinations allowed on any UDP port. Voice chat picks a random high port per
+# call, exactly like a torrent peer does, so port rules cannot tell them apart -
+# but the destination can. 66.22.192.0/18 is Discord Inc. (RIPE US-DISCORD1),
+# which is where their voice servers live.
+ALLOW_UDP_IPS = ["66.22.192.0/18"]
+
+
+def parse_ports(spec):
+    """'53,3478-3481' -> [(53, 53), (3478, 3481)]"""
+    out = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            out.append((int(lo), int(hi)))
+        else:
+            out.append((int(part), int(part)))
+    return out
+
+
+def complement_ports(allowed):
+    """Every port 1-65535 that is NOT allowed, as an Xray port string.
+
+    Derived rather than written out by hand: the allow list is the thing an
+    operator reasons about, and one typo in a hand-written complement silently
+    opens or closes a range nobody meant to touch.
+    """
+    merged = []
+    for lo, hi in sorted(allowed):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append([lo, hi])
+    out, cur = [], 1
+    for lo, hi in merged:
+        if lo > cur:
+            out.append((cur, lo - 1))
+        cur = max(cur, hi + 1)
+    if cur <= 65535:
+        out.append((cur, 65535))
+    return ",".join("{0}-{1}".format(a, b) if a != b else str(a) for a, b in out)
 
 
 # Where x-ui writes the config it is actually running. 3X-UI builds this from the
@@ -202,16 +250,25 @@ def is_tracker_domains(rule):
 
 def is_udp_clamp(rule):
     return (str(rule.get("network") or "").lower() == "udp"
-            and str(rule.get("port") or "") == UDP_EXCEPT_ESSENTIAL)
+            and rule.get("port") and not rule.get("ip")
+            and not rule.get("domain") and not rule.get("protocol"))
+
+
+def is_udp_allow(rule):
+    """The companion rule that lets voice and video through the clamp."""
+    return (str(rule.get("network") or "").lower() == "udp"
+            and rule.get("ip") and not rule.get("port")
+            and not rule.get("domain") and not rule.get("protocol"))
 
 
 def is_guard(rule):
     """Any rule this tool owns."""
     return (is_bt(rule) or is_discovery_ports(rule) or is_tracker_domains(rule)
-            or is_udp_clamp(rule))
+            or is_udp_clamp(rule) or is_udp_allow(rule))
 
 
-def guard_rules(hole, strict):
+def guard_rules(hole, strict, allow_ips=None, allow_ports=None, passthrough="direct",
+                clamp_ports=None):
     """The rules that stop torrents, in the order Xray must check them."""
     out = [
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": hole, "enabled": True},
@@ -220,7 +277,15 @@ def guard_rules(hole, strict):
          "enabled": True},
     ]
     if strict:
-        out.append({"type": "field", "network": "udp", "port": UDP_EXCEPT_ESSENTIAL,
+        ips = list(allow_ips if allow_ips is not None else ALLOW_UDP_IPS)
+        ports = allow_ports if allow_ports is not None else ESSENTIAL_UDP_PORTS
+        # The allow rule has to sit ABOVE the clamp and name an outbound, because
+        # Xray stops at the first match and has no "keep looking" verdict.
+        if ips:
+            out.append({"type": "field", "network": "udp", "ip": ips,
+                        "outboundTag": passthrough, "enabled": True})
+        out.append({"type": "field", "network": "udp",
+                    "port": clamp_ports or complement_ports(parse_ports(ports)),
                     "outboundTag": hole, "enabled": True})
     return out
 
@@ -234,7 +299,8 @@ def rule_users(rule):
     return []
 
 
-def plan(db_path, strict=False, drop_strict=False):
+def plan(db_path, strict=False, drop_strict=False, allow_ips=None,
+         allow_ports=None):
     """Read the database and work out what is wrong. Changes nothing."""
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -301,6 +367,22 @@ def plan(db_path, strict=False, drop_strict=False):
     have_domains = any(is_tracker_domains(r) for _, r in existing)
     have_clamp = any(is_udp_clamp(r) for _, r in existing)
 
+    # Anything the operator edited in the panel is kept, unless this run names a
+    # replacement. Their edits are the whole point of the rules being visible there.
+    if allow_ips is None:
+        prior = [r for _, r in existing if is_udp_allow(r)]
+        allow_ips = prior[0].get("ip") if prior else None
+    clamp_ports = None
+    if allow_ports is None:
+        prior = [r for _, r in existing if is_udp_clamp(r)]
+        clamp_ports = str(prior[0].get("port")) if prior else None
+
+    # The allow rule must name an outbound, so it needs the one ordinary traffic
+    # would have taken anyway.
+    passthrough = next((str(o.get("tag")) for o in xray["outbounds"]
+                        if str(o.get("protocol", "")).lower() != "blackhole"
+                        and o.get("tag")), "direct")
+
     # Count shadowing before anything moves, or the indexes stop meaning anything.
     shadowed = 0
     if first_guard is not None:
@@ -338,8 +420,9 @@ def plan(db_path, strict=False, drop_strict=False):
     if want_clamp and not have_clamp:
         problems.append("uTP over UDP still works. Peers listen on random high ports, so "
                         "nothing but a UDP clamp stops it.")
-        actions.append("block all UDP except DNS, NTP, QUIC and STUN "
-                       "(--strict; this affects games and voice chat)")
+        actions.append("close UDP except {0}, and except traffic to {1} "
+                       "(--strict)".format(ESSENTIAL_UDP_PORTS,
+                                           ", ".join(allow_ips or ALLOW_UDP_IPS) or "nothing"))
     if have_clamp and not want_clamp:
         problems.append("The --strict UDP clamp is in place and you asked to remove it.")
         actions.append("remove the UDP clamp")
@@ -357,8 +440,17 @@ def plan(db_path, strict=False, drop_strict=False):
         actions.append("move the torrent rules above the customer rules "
                        "(position {0} to {1})".format(first_guard, insert_at))
 
-    for offset, rule in enumerate(guard_rules(hole, want_clamp)):
+    for offset, rule in enumerate(guard_rules(hole, want_clamp, allow_ips, allow_ports,
+                                              passthrough, clamp_ports)):
         rules.insert(insert_at + offset, rule)
+
+    if want_clamp:
+        routed = sum(len(rule_users(r)) for r in rules if rule_users(r))
+        if routed:
+            problems.append("{0} customers are routed through a specific outbound. Voice and "
+                            "video allowed past the UDP clamp will leave through '{1}' "
+                            "instead, because Xray stops at the first matching rule."
+                            .format(routed, passthrough))
 
     # Nothing detected, nothing to change: say so rather than inventing work.
     if before == xray and not inbound_fixes:
@@ -561,8 +653,11 @@ def show_state(db_path):
             what = "tracker + DHT ports -> {0}".format(r.get("outboundTag"))
         elif is_tracker_domains(r):
             what = "tracker + DHT hostnames -> {0}".format(r.get("outboundTag"))
+        elif is_udp_allow(r):
+            what = "UDP to {0} -> {1} (allowed)".format(
+                ",".join(r.get("ip") or [])[:34], r.get("outboundTag"))
         elif is_udp_clamp(r):
-            what = "all UDP except DNS/NTP/QUIC/STUN -> {0}".format(r.get("outboundTag"))
+            what = "all other UDP -> {0}".format(r.get("outboundTag"))
         elif users:
             what = "{0} customers -> {1}".format(len(users), r.get("outboundTag"))
         else:
@@ -589,6 +684,8 @@ def rule_label(rule):
         return "tracker + DHT ports"
     if is_tracker_domains(rule):
         return "tracker + DHT hostnames"
+    if is_udp_allow(rule):
+        return "udp allowed"
     if is_udp_clamp(rule):
         return "udp clamp"
     users = rule_users(rule)
@@ -635,6 +732,13 @@ def main():
                          "stops uTP, but it breaks games and voice chat. Stays on once set")
     ap.add_argument("--no-strict", action="store_true",
                     help="remove the --strict UDP clamp")
+    ap.add_argument("--allow-udp-ip", metavar="CIDR,...",
+                    help="destinations allowed on any UDP port under --strict. Defaults to "
+                         "Discord's voice range ({0}). Give a comma-separated list to "
+                         "replace it".format(",".join(ALLOW_UDP_IPS)))
+    ap.add_argument("--allow-udp-port", metavar="PORTS",
+                    help="UDP ports allowed to every destination under --strict "
+                         "(default {0})".format(ESSENTIAL_UDP_PORTS))
     ap.add_argument("--no-restart", action="store_true", help="do not restart x-ui afterwards")
     ap.add_argument("--restore", nargs="?", const=True, metavar="BACKUP",
                     help="undo, using the newest backup or one you name")
@@ -654,7 +758,10 @@ def main():
         sys.exit("--apply needs root: sudo python3 block-torrents.py --apply")
 
     print("Reading {0}".format(db))
-    p = plan(db, strict=args.strict, drop_strict=args.no_strict)
+    allow_ips = ([x.strip() for x in args.allow_udp_ip.split(",") if x.strip()]
+                 if args.allow_udp_ip else None)
+    p = plan(db, strict=args.strict, drop_strict=args.no_strict,
+             allow_ips=allow_ips, allow_ports=args.allow_udp_port)
 
     if not p["problems"]:
         print("\nTorrents are already blocked properly. Nothing to do.")
@@ -682,7 +789,8 @@ def main():
 
     print("\nApplying:")
     apply_plan(p, do_restart=not args.no_restart)
-    after = plan(db, strict=args.strict, drop_strict=args.no_strict)
+    after = plan(db, strict=args.strict, drop_strict=args.no_strict,
+                 allow_ips=allow_ips, allow_ports=args.allow_udp_port)
     print("\nRe-checked: " + ("all clear, torrents are blocked."
                               if not after["problems"]
                               else "{0} problem(s) remain".format(len(after["problems"]))))

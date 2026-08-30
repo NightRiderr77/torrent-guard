@@ -56,17 +56,17 @@ That is a small and shrinking share of real torrent traffic, for two reasons:
 
 **1. Clients encrypt the handshake, by default.** uTorrent, qBittorrent and Transmission all ship with protocol encryption (MSE/PE) turned on. The first bytes are then a Diffie-Hellman key — indistinguishable from noise. There is no `BitTorrent protocol` string left to match, so the sniffer says nothing and the rule never fires.
 
-**2. Most peer traffic is µTP, which runs over UDP.** Xray does not run content sniffers on UDP at all. A `protocol: ["bittorrent"]` rule can never match a UDP packet, no matter how the inbound is configured.
+**2. Most peer traffic is µTP, over UDP.** Xray does carry a µTP sniffer, but it only recognises the `ST_SYN` packet that opens a µTP connection, and only with exact header framing: right type byte, zero timestamp difference, a valid extension chain that consumes the packet exactly. Everything after that first packet — all the actual data — matches nothing. On a live server with the rule in place and sniffing on, torrents kept running at full speed.
 
-Here is the same config measured three ways, against Xray 26.1.23:
+So a `protocol: ["bittorrent"]` rule reliably catches one thing: a plaintext TCP handshake.
 
 | what a client sends | `protocol: ["bittorrent"]` alone |
 | :-- | :-- |
 | BitTorrent handshake, plaintext TCP | blocked |
 | Encrypted peer handshake (MSE/PE) | **passes** |
-| µTP / DHT over UDP | **passes** |
+| µTP to a peer on a random port | **passes** |
 
-You can reproduce that yourself in about ten seconds — see [Proving it](#proving-it) below.
+You can reproduce all of that in about ten seconds — see [Proving it](#proving-it) below.
 
 There are two further ways the rule ends up inert, and this tool fixes both:
 
@@ -100,19 +100,46 @@ Plus, as before: sniffing turned on for every inbound, a `blocked` blackhole out
 
 The tracker hostname patterns are anchored at the start of a label on purpose. `tracker.example.com` is caught; `mytracker.example.com` and `package-tracker.com` are not. A bare keyword match would take out far too much of the ordinary web.
 
-### The one gap left, and how to close it
+### Blocking discovery is not enough on its own
 
-An **encrypted peer connection to a random port still gets through.** Nothing in Xray can tell it apart from any other encrypted stream. It matters much less once discovery is blocked — a new torrent finds nobody to talk to — but a client that is already connected to peers can keep going.
+Cutting off discovery stops a **new** torrent: no tracker, no DHT, no peer list.
+It does **not** stop a client that is already running. uTorrent and qBittorrent
+keep a warm DHT node cache and a peer list on disk, so they never need to look
+anything up again — they go straight to peers on random high UDP ports, and no
+routing rule can tell that traffic from any other UDP.
 
-If you want that closed too:
+If torrents keep running after `--apply`, this is why. Closing UDP is what stops it:
 
 ```bash
 sudo python3 block-torrents.py --strict --apply
 ```
 
-`--strict` blocks **all UDP except 53 (DNS), 123 (NTP), 443 (QUIC) and 3478-3481 (STUN)**. That kills µTP outright, because peers listen on random high ports and there is no list to block.
+`--strict` blocks UDP everywhere except:
 
-> It also breaks games, voice chat and anything else needing arbitrary UDP. That is why it is off by default. Once you turn it on it stays on across later runs; `--no-strict` removes it.
+| Allowed | Why |
+| :-- | :-- |
+| ports `53, 123, 443, 3478-3481, 19302-19309` | DNS, NTP, QUIC/HTTP3, STUN/TURN, Google's STUN range |
+| any port to `66.22.192.0/18` | Discord voice (the range is registered to Discord Inc.) |
+
+Voice chat is the awkward case: it picks a random high port per call, exactly
+like a torrent peer, so no port rule can separate them — but the **destination**
+can. That is why the allowlist is by address, and why Discord keeps working while
+uTP does not.
+
+Anything else that needs arbitrary UDP — a game, a softphone, another voice
+service — needs adding:
+
+```bash
+sudo python3 block-torrents.py --strict --allow-udp-ip 66.22.192.0/18,1.2.3.0/24 --apply
+sudo python3 block-torrents.py --strict --allow-udp-port 53,123,443,3478-3481,27015-27050 --apply
+```
+
+Both lists are written into ordinary routing rules, so they are visible and
+editable in the panel, and a later run keeps whatever you changed there. Once
+`--strict` is on it stays on; `--no-strict` removes it.
+
+The one thing still open either way: an **encrypted peer on an allowed
+destination**. Nothing in Xray can distinguish that from ordinary traffic.
 
 ## Proving it
 
@@ -127,18 +154,23 @@ This starts a throwaway Xray on localhost using **your** routing rules, speaks e
 Against the config almost everyone has:
 
 ```
-  case                                     result    verdict
-  --------------------------------------------------------------------------
-  BitTorrent handshake, plaintext TCP      blocked   ok
-  uTP / DHT on a BitTorrent UDP port       passed    *** LEAK ***
-  tracker announce (tracker.example.net)   passed    *** LEAK ***
-  DHT bootstrap (router.bittorrent.com)    passed    *** LEAK ***
-  ordinary web traffic                     passed    ok
-  a site merely named *tracker*            passed    ok
-  encrypted peer handshake (MSE/PE)        passed    known gap
+  case                                         result    verdict
+  ------------------------------------------------------------------------------
+  BitTorrent handshake, plaintext TCP          blocked   ok
+  peer on a BitTorrent port, TCP               blocked   ok
+  uTP to a peer on a BitTorrent port           blocked   ok
+  uTP to a peer on a random high port          passed    *** LEAK ***
+  tracker announce (tracker.example.net)       passed    *** LEAK ***
+  DHT bootstrap (router.bittorrent.com)        passed    *** LEAK ***
+  ordinary web traffic                         passed    ok
+  a site merely named *tracker*                passed    ok
+  QUIC / HTTP3 (UDP 443)                       passed    ok
+  DNS (UDP 53)                                 passed    ok
+  Discord voice (UDP 50001 to 66.22.192.0/18)  passed    ok
+  encrypted peer handshake (MSE/PE)            passed    known gap
 ```
 
-After `--apply`, the three leaks read `ok`. Exit status is 0 only if every case behaved as intended, so it works in a cron job or a fleet check.
+After `--apply --strict`, every leak reads `ok` and Discord voice still passes. Exit status is 0 only if every case behaved as intended, so it works in a cron job or a fleet check.
 
 ## What is not touched
 
@@ -156,8 +188,10 @@ Backups are taken with SQLite's own backup API and verified before `--apply` wri
 sudo python3 block-torrents.py                  # look only (default)
 sudo python3 block-torrents.py --show           # print current state, no verdict
 sudo python3 block-torrents.py --apply          # fix it
-sudo python3 block-torrents.py --strict         # also clamp UDP (breaks games)
+sudo python3 block-torrents.py --strict         # close UDP; what actually stops uTP
 sudo python3 block-torrents.py --no-strict      # remove the UDP clamp
+sudo python3 block-torrents.py --strict --allow-udp-ip  CIDR,...   # widen by destination
+sudo python3 block-torrents.py --strict --allow-udp-port PORTS     # widen by port
 sudo python3 block-torrents.py --restore        # undo, newest backup
 sudo python3 block-torrents.py --no-restart     # don't restart x-ui
 sudo python3 block-torrents.py --db /path/x-ui.db
@@ -178,7 +212,7 @@ If you run a fleet and want to audit panels remotely rather than SSH into each o
 ```bash
 python3 torrent_guard.py check           # read-only, all panels
 python3 torrent_guard.py apply           # fix them
-python3 torrent_guard.py apply --strict  # fix them, and clamp UDP
+python3 torrent_guard.py apply --strict  # fix them, and close UDP
 python3 torrent_guard.py selftest        # no network, no credentials
 ```
 

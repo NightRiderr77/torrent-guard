@@ -34,14 +34,21 @@ DB_CANDIDATES = ["/etc/x-ui/x-ui.db", "/usr/local/x-ui/x-ui.db", "/opt/x-ui/x-ui
 XRAY_CANDIDATES = ["/usr/local/x-ui/bin/xray-linux-amd64", "/usr/local/x-ui/bin/xray",
                    "/usr/bin/xray", "/usr/local/bin/xray"]
 
-# Hostnames the harness pretends to reach, mapped to 127.0.0.1 by Xray's own hosts
-# table - so this needs no DNS, no internet, and never leaves the machine.
-FAKE_HOSTS = {
-    "tracker.example.net": "127.0.0.1",      # must be blocked: matches ^tracker\.
-    "router.bittorrent.com": "127.0.0.1",    # must be blocked: DHT bootstrap node
-    "www.example.net": "127.0.0.1",          # must pass: ordinary browsing
-    "mytracker.example.net": "127.0.0.1",    # must pass: only *contains* "tracker"
-}
+# Addresses the probes aim at. Not one packet is ever sent to them - every
+# outbound redirects to the local listener - but routing sees them, so IP rules
+# are exercised for real.
+#
+# PEER_IP has to be a genuinely PUBLIC address. The obvious choice is a
+# documentation range like 203.0.113.0/24, but geoip:private covers every
+# reserved range - documentation, benchmark and CGNAT included - and almost every
+# panel carries a geoip:private rule. Probing one of those would report the whole
+# suite as blocked no matter what the torrent rules did.
+PEER_IP = "185.199.108.153"       # public, stable, and never actually contacted
+DISCORD_VOICE_IP = "66.22.192.7"  # inside Discord's voice range, 66.22.192.0/18
+
+# Not one of DISCOVERY_PORTS: these cases test the protocol rules, and reusing a
+# blocked port would let the port rule answer for them.
+PEER_PORT = 51999
 
 
 def first_existing(paths, what):
@@ -91,8 +98,7 @@ def via_tcp(socks_port, host, port, payload):
         s.settimeout(6)
         s.sendall(b"\x05\x01\x00")
         s.recv(2)
-        hb = host.encode()
-        s.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port))
+        s.sendall(b"\x05\x01\x00" + socks_addr(host) + struct.pack("!H", port))
         rep = s.recv(10)
         if len(rep) < 2 or rep[1] != 0:
             return True
@@ -105,7 +111,16 @@ def via_tcp(socks_port, host, port, payload):
     return len(TCP_HITS) == before
 
 
-def via_udp(socks_port, port, payload):
+def socks_addr(host):
+    """SOCKS5 address field: literal IP where we have one, otherwise the name."""
+    try:
+        return b"\x01" + socket.inet_aton(host)
+    except OSError:
+        hb = host.encode()
+        return b"\x03" + bytes([len(hb)]) + hb
+
+
+def via_udp(socks_port, host, port, payload):
     before = len(UDP_HITS)
     try:
         ctl = socket.create_connection(("127.0.0.1", socks_port), timeout=6)
@@ -119,7 +134,7 @@ def via_udp(socks_port, port, payload):
         relay = struct.unpack("!H", rep[8:10])[0]
         u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         u.settimeout(4)
-        hdr = b"\x00\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", port)
+        hdr = b"\x00\x00\x00" + socks_addr(host) + struct.pack("!H", port)
         for _ in range(3):
             u.sendto(hdr + payload, ("127.0.0.1", relay))
             time.sleep(0.25)
@@ -132,14 +147,19 @@ def via_udp(socks_port, port, payload):
     return len(UDP_HITS) == before
 
 
-def build_config(template, socks_port, sniffing):
+def build_config(template, socks_port, sniffing, probe_port):
     """The server's own routing rules, reached through a local socks inbound.
 
-    Customer outbounds become plain freedom outbounds so the config runs anywhere;
-    the routing RULES - the thing actually under test - are left exactly as they are.
+    Every outbound that is not a blackhole becomes a freedom outbound that
+    redirects to the probe listener. Routing still sees the real destination -
+    address, port, sniffed protocol and all - so the rules under test behave
+    exactly as they would in production, but anything they let through lands
+    here instead of on the internet. That is what makes it possible to probe a
+    destination like Discord's voice range without sending it a packet.
     """
     cfg = json.loads(json.dumps(template))
     rules = (cfg.get("routing") or {}).get("rules") or []
+    sink = {"redirect": "127.0.0.1:{0}".format(probe_port)}
 
     outs = []
     for o in cfg.get("outbounds") or []:
@@ -147,47 +167,24 @@ def build_config(template, socks_port, sniffing):
         if str(o.get("protocol", "")).lower() == "blackhole":
             outs.append({"tag": tag, "protocol": "blackhole", "settings": {}})
         else:
-            outs.append({"tag": tag, "protocol": "freedom",
-                         "settings": {"domainStrategy": "UseIP"}})
+            outs.append({"tag": tag, "protocol": "freedom", "settings": dict(sink)})
 
     have = set(str(o.get("tag") or "") for o in outs)
     for r in rules:
         tag = str(r.get("outboundTag") or "")
         if tag and tag != "api" and tag not in have:
-            outs.append({"tag": tag, "protocol": "freedom",
-                         "settings": {"domainStrategy": "UseIP"}})
+            outs.append({"tag": tag, "protocol": "freedom", "settings": dict(sink)})
             have.add(tag)
     if not any(o["protocol"] == "freedom" for o in outs):
-        outs.insert(0, {"tag": "direct", "protocol": "freedom",
-                        "settings": {"domainStrategy": "UseIP"}})
+        outs.insert(0, {"tag": "direct", "protocol": "freedom", "settings": dict(sink)})
 
     # There is no api inbound here, so an api rule would stop Xray starting.
     rules = [r for r in rules
              if "api" not in [str(x) for x in (r.get("inboundTag") or [])]
              and str(r.get("outboundTag")) != "api"]
 
-    # The probes necessarily talk to 127.0.0.1, so a private-IP rule would catch
-    # every one of them and report a clean sweep no matter what else is wrong.
-    # That rule protects the server's own network and has nothing to do with
-    # torrents, so take it out rather than let it answer for the rules under test.
-    kept, dropped = [], 0
-    for r in rules:
-        ips = [str(x).lower() for x in (r.get("ip") or [])]
-        only_private = bool(ips) and all(
-            i.startswith(("geoip:private", "127.", "10.", "192.168.", "::1", "fc00:",
-                          "fe80:")) or i.startswith("172.") for i in ips)
-        if only_private and not (r.get("protocol") or r.get("domain") or r.get("port")):
-            dropped += 1
-            continue
-        kept.append(r)
-    if dropped:
-        print("  (ignoring {0} private-IP rule(s): the probes use 127.0.0.1, so they "
-              "would mask everything)".format(dropped))
-    rules = kept
-
     return {
         "log": {"loglevel": "warning"},
-        "dns": {"hosts": dict(FAKE_HOSTS), "servers": ["localhost"]},
         "inbounds": [{"tag": "probe", "listen": "127.0.0.1", "port": socks_port,
                       "protocol": "socks",
                       "settings": {"auth": "noauth", "udp": True},
@@ -233,21 +230,9 @@ def main():
                  "again".format(db))
 
     socks_port = free_port()
-    tcp_port = free_port()
-    # Any port in the BitTorrent range will do; take the first this box will lend us,
-    # because a torrent client already running here will be sitting on 6881.
-    udp_port = None
-    for candidate in range(6881, 6890):
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            probe.bind(("127.0.0.1", candidate))
-            udp_port = candidate
-        except OSError:
-            continue
-        finally:
-            probe.close()
-        break
-    cfg = build_config(json.loads(row[0]), socks_port, weakest_sniffing(sniff_rows))
+    probe_port = free_port()
+    cfg = build_config(json.loads(row[0]), socks_port, weakest_sniffing(sniff_rows),
+                       probe_port)
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".verify-xray.json")
     with open(path, "w") as fh:
@@ -261,10 +246,8 @@ def main():
             sys.stdout.write(proc.stdout.read().decode("utf-8", "replace"))
             sys.exit("xray would not start with this routing config")
 
-        threading.Thread(target=tcp_listener, args=(tcp_port,), daemon=True).start()
-        udp_ok = udp_port is not None
-        if udp_ok:
-            threading.Thread(target=udp_listener, args=(udp_port,), daemon=True).start()
+        threading.Thread(target=tcp_listener, args=(probe_port,), daemon=True).start()
+        threading.Thread(target=udp_listener, args=(probe_port,), daemon=True).start()
         time.sleep(0.4)
 
         bt = b"\x13BitTorrent protocol" + b"\x00" * 8 + b"A" * 20 + b"B" * 20
@@ -280,34 +263,39 @@ def main():
 
         cases = [
             ("BitTorrent handshake, plaintext TCP", True,
-             lambda: via_tcp(socks_port, "127.0.0.1", tcp_port, bt)),
-            ("uTP / DHT on a BitTorrent UDP port", True,
-             lambda: via_udp(socks_port, udp_port, utp)),
+             lambda: via_tcp(socks_port, PEER_IP, PEER_PORT, bt)),
+            ("peer on a BitTorrent port, TCP", True,
+             lambda: via_tcp(socks_port, PEER_IP, 6881, mse)),
+            ("uTP to a peer on a BitTorrent port", True,
+             lambda: via_udp(socks_port, PEER_IP, 6881, utp)),
+            ("uTP to a peer on a random high port", True,
+             lambda: via_udp(socks_port, PEER_IP, 54321, utp)),
             ("tracker announce (tracker.example.net)", True,
-             lambda: via_tcp(socks_port, "tracker.example.net", tcp_port,
+             lambda: via_tcp(socks_port, "tracker.example.net", 443,
                              announce("tracker.example.net"))),
             ("DHT bootstrap (router.bittorrent.com)", True,
-             lambda: via_tcp(socks_port, "router.bittorrent.com", tcp_port,
-                             announce("router.bittorrent.com"))),
+             lambda: via_udp(socks_port, "router.bittorrent.com", 6881, utp)),
             ("ordinary web traffic", False,
-             lambda: via_tcp(socks_port, "www.example.net", tcp_port,
+             lambda: via_tcp(socks_port, "www.example.net", 443,
                              web("www.example.net"))),
             ("a site merely named *tracker*", False,
-             lambda: via_tcp(socks_port, "mytracker.example.net", tcp_port,
+             lambda: via_tcp(socks_port, "mytracker.example.net", 443,
                              web("mytracker.example.net"))),
+            ("QUIC / HTTP3 (UDP 443)", False,
+             lambda: via_udp(socks_port, PEER_IP, 443, b"\x00" * 64)),
+            ("DNS (UDP 53)", False,
+             lambda: via_udp(socks_port, PEER_IP, 53, b"\x00" * 32)),
+            ("Discord voice (UDP 50001 to 66.22.192.0/18)", False,
+             lambda: via_udp(socks_port, DISCORD_VOICE_IP, 50001, b"\x80" + b"\x00" * 63)),
             ("encrypted peer handshake (MSE/PE)", None,
-             lambda: via_tcp(socks_port, "127.0.0.1", tcp_port, mse)),
+             lambda: via_tcp(socks_port, PEER_IP, PEER_PORT, mse)),
         ]
 
         print("")
-        print("  {0:<40} {1:<9} {2}".format("case", "result", "verdict"))
-        print("  " + "-" * 74)
+        print("  {0:<44} {1:<9} {2}".format("case", "result", "verdict"))
+        print("  " + "-" * 78)
         failures = 0
         for name, must_block, run in cases:
-            if not udp_ok and "UDP" in name:
-                print("  {0:<40} {1:<9} {2}".format(name, "skipped",
-                                                    "port 6881 is busy on this box"))
-                continue
             blocked = run()
             got = "blocked" if blocked else "passed"
             if must_block is None:
@@ -319,11 +307,19 @@ def main():
             else:
                 verdict = "ok" if not blocked else "*** over-blocking ***"
                 failures += 0 if not blocked else 1
-            print("  {0:<40} {1:<9} {2}".format(name, got, verdict))
+            print("  {0:<44} {1:<9} {2}".format(name, got, verdict))
         print("")
         if failures:
-            print("{0} case(s) wrong. Fix with: sudo python3 block-torrents.py "
-                  "--apply".format(failures))
+            clamped = any(str(r.get("network") or "").lower() == "udp" and r.get("port")
+                          for r in (cfg.get("routing") or {}).get("rules", []))
+            print("{0} case(s) wrong.".format(failures))
+            if not clamped:
+                print("A client with a warm peer cache does not need a tracker or the "
+                      "DHT, so blocking discovery alone will not stop one already "
+                      "running. Closing UDP is what stops it:")
+                print("  sudo python3 block-torrents.py --strict --apply")
+            else:
+                print("  sudo python3 block-torrents.py --apply")
         else:
             print("Every case behaved as intended.")
         return 1 if failures else 0
