@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # routeOnly keeps the original destination and uses the sniffed result purely for
 # routing decisions. That matters: plain destOverride rewrites the destination to
@@ -49,6 +49,43 @@ SAFE_SNIFFING = {
     "routeOnly": True,
 }
 BT_PROTOCOLS = ["bittorrent"]
+
+# Sniffing only ever names PLAINTEXT BitTorrent over TCP, and that is a small and
+# shrinking share of real torrent traffic. Clients turn on protocol encryption
+# (MSE/PE) by default, so the handshake is a Diffie-Hellman key with no
+# "BitTorrent protocol" string left to match; and most peer traffic is uTP over
+# UDP, which Xray does not content-sniff at all, so a protocol rule can never
+# match it. Verified against Xray 26.1.23 - extras/verify-blocking.py reproduces
+# all of it in about ten seconds.
+#
+# Identifying peer traffic is therefore a losing game. What works is cutting off
+# peer DISCOVERY: a client that cannot reach a tracker or the DHT has no peer
+# list, and encryption does not help it find one.
+DISCOVERY_PORTS = "6881-6889,6969,1337,2710,51413"
+
+# Anchored at the start of a label on purpose: "tracker.x.com" is caught,
+# "mytracker.x.com" and "package-tracker.com" are not.
+TRACKER_DOMAINS = [
+    "domain:router.bittorrent.com",
+    "domain:router.utorrent.com",
+    "domain:dht.transmissionbt.com",
+    "domain:dht.libtorrent.org",
+    "domain:router.bitcomet.com",
+    "domain:dht.aelitis.com",
+    "domain:opentrackr.org",
+    "domain:openbittorrent.com",
+    "domain:torrent.eu.org",
+    r"regexp:^tracker[0-9]*\.",
+    r"regexp:^(open|udp|bt)tracker[0-9]*\.",
+    r"regexp:^announce\.",
+    r"regexp:^dht\.",
+]
+DHT_SENTINEL = "domain:router.bittorrent.com"
+
+# strict only: every UDP port except 53 (DNS), 123 (NTP), 443 (QUIC) and
+# 3478-3481 (STUN). This is what finally kills uTP, and it also breaks games and
+# voice chat, which is why it is opt-in.
+UDP_EXCEPT_ESSENTIAL = "1-52,54-122,124-442,444-3477,3482-65535"
 
 OK, WARN, BAD = "ok", "warn", "bad"
 
@@ -80,6 +117,40 @@ def _is_bt_rule(rule):
     return "bittorrent" in [str(x).lower() for x in p]
 
 
+def _is_discovery_ports_rule(rule):
+    return str(rule.get("port") or "") == DISCOVERY_PORTS and not rule.get("domain")
+
+
+def _is_tracker_domain_rule(rule):
+    return DHT_SENTINEL in (rule.get("domain") or [])
+
+
+def _is_udp_clamp_rule(rule):
+    return (str(rule.get("network") or "").lower() == "udp"
+            and str(rule.get("port") or "") == UDP_EXCEPT_ESSENTIAL)
+
+
+def _is_guard_rule(rule):
+    """Any rule this tool owns."""
+    return (_is_bt_rule(rule) or _is_discovery_ports_rule(rule)
+            or _is_tracker_domain_rule(rule) or _is_udp_clamp_rule(rule))
+
+
+def guard_rules(hole, strict=False):
+    """The rules that stop torrents, in the order Xray must check them."""
+    out = [
+        {"type": "field", "protocol": list(BT_PROTOCOLS), "outboundTag": hole,
+         "enabled": True},
+        {"type": "field", "port": DISCOVERY_PORTS, "outboundTag": hole, "enabled": True},
+        {"type": "field", "domain": list(TRACKER_DOMAINS), "outboundTag": hole,
+         "enabled": True},
+    ]
+    if strict:
+        out.append({"type": "field", "network": "udp", "port": UDP_EXCEPT_ESSENTIAL,
+                    "outboundTag": hole, "enabled": True})
+    return out
+
+
 def blackhole_tags(xray):
     return [
         str(o.get("tag"))
@@ -88,7 +159,7 @@ def blackhole_tags(xray):
     ]
 
 
-def audit(xray, inbounds):
+def audit(xray, inbounds, strict=False):
     """Return a list of findings. An empty list means torrents are genuinely blocked."""
     findings = []
     rules = (xray.get("routing") or {}).get("rules") or []
@@ -125,6 +196,35 @@ def audit(xray, inbounds):
             "code": "no-blackhole-outbound", "severity": BAD, "where": "outbounds",
             "detail": "no blackhole outbound exists, so there is nowhere to drop torrent traffic",
             "fix": 'add {"tag": "blocked", "protocol": "blackhole"}',
+        })
+
+    # --- peer discovery ----------------------------------------------------- #
+    # These come first because they hold whether or not a bittorrent rule exists,
+    # and the check below returns early when it does not.
+    if not any(_is_discovery_ports_rule(r) for r in rules):
+        findings.append({
+            "code": "no-discovery-port-rule", "severity": BAD, "where": "routing.rules",
+            "detail": "nothing blocks the tracker and DHT ports, so clients still find "
+                      "peers and still torrent over UDP, which sniffing never sees",
+            "fix": "block ports {0}".format(DISCOVERY_PORTS),
+        })
+
+    if not any(_is_tracker_domain_rule(r) for r in rules):
+        findings.append({
+            "code": "no-tracker-domain-rule", "severity": BAD, "where": "routing.rules",
+            "detail": "the DHT bootstrap nodes and tracker hostnames are reachable, so a "
+                      "client can fetch a peer list and encrypt everything after that",
+            "fix": "block the DHT bootstrap nodes and tracker hostnames",
+        })
+
+    # Only when asked for: the clamp is a deliberate trade, not a defect, so a
+    # plain check must not nag about something it should never turn on by itself.
+    if strict and not any(_is_udp_clamp_rule(r) for r in rules):
+        findings.append({
+            "code": "no-udp-clamp", "severity": BAD, "where": "routing.rules",
+            "detail": "uTP over UDP still works; peers listen on random high ports, so "
+                      "only a UDP clamp stops it",
+            "fix": "block all UDP except DNS, NTP, QUIC and STUN",
         })
 
     # --- the rule itself ---------------------------------------------------- #
@@ -179,7 +279,7 @@ def audit(xray, inbounds):
 # --------------------------------------------------------------------------- #
 # Repair
 # --------------------------------------------------------------------------- #
-def repair_xray(xray):
+def repair_xray(xray, strict=False, drop_strict=False):
     """Return (new_xray, [descriptions of what changed]). The input is not mutated."""
     x = copy.deepcopy(xray)
     changes = []
@@ -198,33 +298,52 @@ def repair_xray(xray):
         changes.append("added blackhole outbound {0!r}".format(tag))
     hole = holes[0]
 
-    bt_idx = next((i for i, r in enumerate(rules) if _is_bt_rule(r)), None)
-    if bt_idx is None:
-        rule = {"type": "field", "protocol": list(BT_PROTOCOLS), "outboundTag": hole, "enabled": True}
+    # Everything this tool owns comes out, is rebuilt correctly, and goes back as
+    # one block above the customer rules. Rebuilding beats patching in place: one
+    # shape to reason about, and a second run is a genuine no-op.
+    existing = [(i, r) for i, r in enumerate(rules) if _is_guard_rule(r)]
+    first_guard = existing[0][0] if existing else None
+    have_bt = any(_is_bt_rule(r) for _, r in existing)
+    have_ports = any(_is_discovery_ports_rule(r) for _, r in existing)
+    have_domains = any(_is_tracker_domain_rule(r) for _, r in existing)
+    have_clamp = any(_is_udp_clamp_rule(r) for _, r in existing)
+
+    for i, _ in reversed(existing):
+        rules.pop(i)
+
+    if not have_bt:
         changes.append("added a bittorrent routing rule")
     else:
-        rule = rules.pop(bt_idx)
-        rule["type"] = rule.get("type", "field")
-        rule["protocol"] = list(BT_PROTOCOLS)
-        if str(rule.get("outboundTag")) != hole:
+        bt = [r for _, r in existing if _is_bt_rule(r)][0]
+        if str(bt.get("outboundTag")) != hole:
             changes.append("repointed the bittorrent rule to {0!r}".format(hole))
-            rule["outboundTag"] = hole
-        if rule.get("enabled") is False:
-            rule["enabled"] = True
+        if bt.get("enabled") is False:
             changes.append("re-enabled the bittorrent rule")
+    if not have_ports:
+        changes.append("blocked the tracker and DHT ports ({0})".format(DISCOVERY_PORTS))
+    if not have_domains:
+        changes.append("blocked the DHT bootstrap nodes and tracker hostnames")
 
-    # Slot it directly after the api rules, which must stay first, and therefore
-    # above every user-matching rule.
+    # Sticky: a later plain run must not quietly undo a deliberate choice.
+    want_clamp = (strict or have_clamp) and not drop_strict
+    if want_clamp and not have_clamp:
+        changes.append("blocked all UDP except DNS, NTP, QUIC and STUN (strict)")
+    if have_clamp and not want_clamp:
+        changes.append("removed the UDP clamp")
+
+    # Slot the block directly after the api rules, which must stay first, and
+    # therefore above every user-matching rule.
     insert_at = 0
     for i, r in enumerate(rules):
         if _is_api_rule(r):
             insert_at = i + 1
         else:
             break
-    if bt_idx is not None and bt_idx != insert_at:
-        changes.append("moved the bittorrent rule from index {0} to {1}, above the user "
-                       "rules".format(bt_idx, insert_at))
-    rules.insert(insert_at, rule)
+    if first_guard is not None and first_guard != insert_at:
+        changes.append("moved the torrent rules from index {0} to {1}, above the user "
+                       "rules".format(first_guard, insert_at))
+    for offset, rule in enumerate(guard_rules(hole, want_clamp)):
+        rules.insert(insert_at + offset, rule)
     return x, changes
 
 
@@ -450,12 +569,13 @@ def run(args):
             panel.login()
             xray = panel.get_xray()
             inbounds = panel.get_inbounds()
-            entry["findings"] = audit(xray, inbounds)
+            entry["findings"] = audit(xray, inbounds, strict=args.strict)
             entry["inbounds"] = len(inbounds)
 
             if args.command == "apply" and entry["findings"]:
                 entry["backup"] = backup(args.backup_dir, entry["panel"], xray)
-                new_xray, changes = repair_xray(xray)
+                new_xray, changes = repair_xray(
+                    xray, strict=args.strict, drop_strict=args.no_strict)
                 if changes:
                     if not args.dry_run:
                         panel.put_xray(new_xray)
@@ -565,7 +685,26 @@ def selftest():
     first_user = next((i for i, r in enumerate(rules) if _rule_users(r)), len(rules))
     check("bittorrent rule now precedes every user rule", bt < first_user)
     check("api rule is still first", _is_api_rule(rules[0]))
-    check("no rule was lost", len(rules) == len(SAMPLE["xray"]["routing"]["rules"]))
+    check("no rule was lost", len(rules) == len(SAMPLE["xray"]["routing"]["rules"]) + 2)
+    check("tracker and DHT ports are blocked",
+          any(_is_discovery_ports_rule(r) for r in rules))
+    check("tracker and DHT hostnames are blocked",
+          any(_is_tracker_domain_rule(r) for r in rules))
+    check("every torrent rule precedes every user rule",
+          max(i for i, r in enumerate(rules) if _is_guard_rule(r)) < first_user)
+    check("no UDP clamp unless it was asked for",
+          not any(_is_udp_clamp_rule(r) for r in rules))
+    check("repair is idempotent", repair_xray(fixed)[0]["routing"]["rules"] == rules)
+    _strict = repair_xray(SAMPLE["xray"], strict=True)[0]
+    check("strict adds the UDP clamp",
+          any(_is_udp_clamp_rule(r) for r in _strict["routing"]["rules"]))
+    check("strict survives a later plain run",
+          any(_is_udp_clamp_rule(r) for r in repair_xray(_strict)[0]["routing"]["rules"]))
+    check("no-strict removes the clamp",
+          not any(_is_udp_clamp_rule(r) for r
+                  in repair_xray(_strict, drop_strict=True)[0]["routing"]["rules"]))
+    check("a clean config still audits clean under --strict",
+          audit(_strict, [], strict=True) == [])
     check("reported the move", any("moved" in ch for ch in changes))
     check("the caller's config was not mutated",
           SAMPLE["xray"]["routing"]["rules"][3]["protocol"] == ["bittorrent"])
@@ -609,6 +748,11 @@ def main():
                     help="with apply: show what would change without saving")
     ap.add_argument("--backup-dir", default="backups",
                     help="where to save routing backups (default: backups)")
+    ap.add_argument("--strict", action="store_true",
+                    help="also block all UDP except DNS, NTP, QUIC and STUN. This is "
+                         "what stops uTP, but it breaks games and voice chat. Stays "
+                         "on once set")
+    ap.add_argument("--no-strict", action="store_true", help="remove the UDP clamp")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--insecure", action="store_true",
                     help="skip TLS verification (self-signed panels)")

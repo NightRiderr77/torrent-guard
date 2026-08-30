@@ -33,7 +33,7 @@ import sqlite3
 import subprocess
 import sys
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 DB_CANDIDATES = [
     "/etc/x-ui/x-ui.db",
@@ -53,6 +53,51 @@ SNIFFING = {
     "metadataOnly": False,
     "routeOnly": True,
 }
+
+# Sniffing only ever names PLAINTEXT BitTorrent over TCP, and that is a small and
+# shrinking share of real torrent traffic:
+#
+#   * uTorrent, qBittorrent and Transmission turn on protocol encryption (MSE/PE)
+#     by default. The first bytes are then a Diffie-Hellman key - indistinguishable
+#     from noise - so there is no "BitTorrent protocol" string left to match.
+#   * Most peer traffic is uTP over UDP, and Xray does not run content sniffers on
+#     UDP at all. A `protocol: bittorrent` rule can never match a UDP packet.
+#
+# Verified against Xray 26.1.23 - see extras/verify-blocking.py, which reproduces
+# all of this locally in about ten seconds.
+#
+# So identifying peer traffic is a losing game. What actually works is cutting off
+# peer DISCOVERY: a client that cannot reach a tracker or the DHT has no peer list,
+# and encryption does not help it find one.
+
+# Tracker and DHT ports. Both TCP and UDP - trackers answer on TCP too.
+DISCOVERY_PORTS = "6881-6889,6969,1337,2710,51413"
+
+# The public DHT bootstrap nodes, plus trackers by name. The regexes are anchored
+# at the start of a label on purpose: "tracker.x.com" is caught, "mytracker.x.com"
+# and "package-tracker.com" are not. A bare keyword match would block far too much.
+TRACKER_DOMAINS = [
+    "domain:router.bittorrent.com",
+    "domain:router.utorrent.com",
+    "domain:dht.transmissionbt.com",
+    "domain:dht.libtorrent.org",
+    "domain:router.bitcomet.com",
+    "domain:dht.aelitis.com",
+    "domain:opentrackr.org",
+    "domain:openbittorrent.com",
+    "domain:torrent.eu.org",
+    r"regexp:^tracker[0-9]*\.",
+    r"regexp:^(open|udp|bt)tracker[0-9]*\.",
+    r"regexp:^announce\.",
+    r"regexp:^dht\.",
+]
+DHT_SENTINEL = "domain:router.bittorrent.com"
+
+# --strict only. Every UDP port EXCEPT 53 (DNS), 123 (NTP), 443 (QUIC) and
+# 3478-3481 (STUN). This is what finally kills uTP, because peers listen on random
+# high ports and there is no list to block. It also breaks games, voice chat and
+# anything else that needs arbitrary UDP, which is why it is off by default.
+UDP_EXCEPT_ESSENTIAL = "1-52,54-122,124-442,444-3477,3482-65535"
 
 
 def find_db(explicit=None):
@@ -90,6 +135,39 @@ def is_api(rule):
     return "api" in [str(x) for x in t] or str(rule.get("outboundTag")) == "api"
 
 
+def is_discovery_ports(rule):
+    return str(rule.get("port") or "") == DISCOVERY_PORTS and not rule.get("domain")
+
+
+def is_tracker_domains(rule):
+    return DHT_SENTINEL in (rule.get("domain") or [])
+
+
+def is_udp_clamp(rule):
+    return (str(rule.get("network") or "").lower() == "udp"
+            and str(rule.get("port") or "") == UDP_EXCEPT_ESSENTIAL)
+
+
+def is_guard(rule):
+    """Any rule this tool owns."""
+    return (is_bt(rule) or is_discovery_ports(rule) or is_tracker_domains(rule)
+            or is_udp_clamp(rule))
+
+
+def guard_rules(hole, strict):
+    """The rules that stop torrents, in the order Xray must check them."""
+    out = [
+        {"type": "field", "protocol": ["bittorrent"], "outboundTag": hole, "enabled": True},
+        {"type": "field", "port": DISCOVERY_PORTS, "outboundTag": hole, "enabled": True},
+        {"type": "field", "domain": list(TRACKER_DOMAINS), "outboundTag": hole,
+         "enabled": True},
+    ]
+    if strict:
+        out.append({"type": "field", "network": "udp", "port": UDP_EXCEPT_ESSENTIAL,
+                    "outboundTag": hole, "enabled": True})
+    return out
+
+
 def rule_users(rule):
     u = rule.get("user")
     if isinstance(u, list):
@@ -99,7 +177,7 @@ def rule_users(rule):
     return []
 
 
-def plan(db_path):
+def plan(db_path, strict=False, drop_strict=False):
     """Read the database and work out what is wrong. Changes nothing."""
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -149,24 +227,58 @@ def plan(db_path):
         actions.append("add a blackhole outbound called 'blocked'")
     hole = holes[0]
 
-    bt_idx = next((i for i, r in enumerate(rules) if is_bt(r)), None)
-    if bt_idx is None:
-        rule = {"type": "field", "protocol": ["bittorrent"], "outboundTag": hole, "enabled": True}
+    # Everything this tool owns comes out, is rebuilt correctly, and goes back as one
+    # block above the customer rules. Rebuilding beats patching in place: there is
+    # only one shape to reason about, and a second run is a genuine no-op.
+    existing = [(i, r) for i, r in enumerate(rules) if is_guard(r)]
+    first_guard = existing[0][0] if existing else None
+    have_bt = any(is_bt(r) for _, r in existing)
+    have_ports = any(is_discovery_ports(r) for _, r in existing)
+    have_domains = any(is_tracker_domains(r) for _, r in existing)
+    have_clamp = any(is_udp_clamp(r) for _, r in existing)
+
+    # Count shadowing before anything moves, or the indexes stop meaning anything.
+    shadowed = 0
+    if first_guard is not None:
+        shadowed = sum(len(rule_users(r)) for r in rules[:first_guard] if not is_api(r))
+
+    for i, _ in reversed(existing):
+        rules.pop(i)
+
+    if not have_bt:
         problems.append("There is no rule for torrent traffic at all.")
         actions.append("add a rule sending torrents to '{0}'".format(hole))
     else:
-        rule = rules.pop(bt_idx)
-        rule["type"] = rule.get("type", "field")
-        rule["protocol"] = ["bittorrent"]
-        if str(rule.get("outboundTag")) != hole:
+        bt = [r for _, r in existing if is_bt(r)][0]
+        if str(bt.get("outboundTag")) != hole:
             problems.append("The torrent rule forwards to '{0}' instead of dropping "
-                            "it.".format(rule.get("outboundTag")))
+                            "it.".format(bt.get("outboundTag")))
             actions.append("point the torrent rule at '{0}'".format(hole))
-            rule["outboundTag"] = hole
-        if rule.get("enabled") is False:
+        if bt.get("enabled") is False:
             problems.append("The torrent rule is switched off.")
             actions.append("switch the torrent rule back on")
-            rule["enabled"] = True
+
+    if not have_ports:
+        problems.append("The tracker and DHT ports are open, so clients still find peers "
+                        "and still torrent over UDP - which sniffing never sees.")
+        actions.append("block the tracker and DHT ports ({0})".format(DISCOVERY_PORTS))
+
+    if not have_domains:
+        problems.append("The DHT bootstrap nodes and tracker hostnames are reachable, so a "
+                        "client can fetch a peer list and encrypt everything after that.")
+        actions.append("block the DHT bootstrap nodes and tracker hostnames")
+
+    # The clamp is sticky: once an operator turns it on it stays on, because a later
+    # plain --apply must not quietly undo a deliberate choice. --no-strict removes it.
+    want_clamp = (strict or have_clamp) and not drop_strict
+    if want_clamp and not have_clamp:
+        problems.append("uTP over UDP still works. Peers listen on random high ports, so "
+                        "nothing but a UDP clamp stops it.")
+        actions.append("block all UDP except DNS, NTP, QUIC and STUN "
+                       "(--strict; this affects games and voice chat)")
+    if have_clamp and not want_clamp:
+        problems.append("The --strict UDP clamp is in place and you asked to remove it.")
+        actions.append("remove the UDP clamp")
 
     insert_at = 0
     for r in rules:
@@ -175,14 +287,18 @@ def plan(db_path):
         else:
             break
 
-    if bt_idx is not None:
-        shadowed = sum(len(rule_users(r)) for r in rules[:bt_idx] if not is_api(r))
-        if shadowed:
-            problems.append("{0} customers are matched by an earlier rule, so the torrent rule "
-                            "is never reached for them.".format(shadowed))
-            actions.append("move the torrent rule above the customer rules "
-                           "(position {0} to {1})".format(bt_idx, insert_at))
-    rules.insert(insert_at, rule)
+    if shadowed:
+        problems.append("{0} customers are matched by an earlier rule, so the torrent rules "
+                        "are never reached for them.".format(shadowed))
+        actions.append("move the torrent rules above the customer rules "
+                       "(position {0} to {1})".format(first_guard, insert_at))
+
+    for offset, rule in enumerate(guard_rules(hole, want_clamp)):
+        rules.insert(insert_at + offset, rule)
+
+    # Nothing detected, nothing to change: say so rather than inventing work.
+    if before == xray and not inbound_fixes:
+        problems, actions = [], []
 
     return {"db": db_path, "problems": problems, "actions": actions,
             "inbound_fixes": inbound_fixes, "xray_before": before, "xray_after": xray,
@@ -364,15 +480,21 @@ def show_state(db_path):
         if is_api(r):
             what = "panel api"
         elif is_bt(r):
-            what = "TORRENTS -> {0}".format(r.get("outboundTag"))
+            what = "TORRENTS, plaintext -> {0}".format(r.get("outboundTag"))
+        elif is_discovery_ports(r):
+            what = "tracker + DHT ports -> {0}".format(r.get("outboundTag"))
+        elif is_tracker_domains(r):
+            what = "tracker + DHT hostnames -> {0}".format(r.get("outboundTag"))
+        elif is_udp_clamp(r):
+            what = "all UDP except DNS/NTP/QUIC/STUN -> {0}".format(r.get("outboundTag"))
         elif users:
             what = "{0} customers -> {1}".format(len(users), r.get("outboundTag"))
         else:
             what = "{0} -> {1}".format(
                 ",".join(r.get("ip") or r.get("domain") or ["other"])[:30], r.get("outboundTag"))
         note = ""
-        if is_bt(r):
-            note = "  <-- torrent rule"
+        if is_guard(r):
+            note = "  <-- torrent guard"
             if str(r.get("outboundTag")) not in holes:
                 note += " (NOT a blackhole - it is being forwarded)"
             hit = True
@@ -380,7 +502,21 @@ def show_state(db_path):
             note = "  <-- these customers never reach the torrent rule"
         print("  [{0}] {1}{2}".format(i, what, note))
     if not hit:
-        print("  (no torrent rule present)")
+        print("  (no torrent rules present)")
+
+
+def rule_label(rule):
+    """One short phrase naming what a rule is for, used in the before/after list."""
+    if is_bt(rule):
+        return "bittorrent, plaintext"
+    if is_discovery_ports(rule):
+        return "tracker + DHT ports"
+    if is_tracker_domains(rule):
+        return "tracker + DHT hostnames"
+    if is_udp_clamp(rule):
+        return "udp clamp"
+    users = rule_users(rule)
+    return "{0} customers".format(len(users)) if users else "other"
 
 
 def show_diff(p):
@@ -390,13 +526,9 @@ def show_diff(p):
         print("  inbounds[id={0}].sniffing".format(ib_id))
         print("    {0}".format(sniff_json))
     if p["xray_before"] is not None:
-        b = [(("api" if is_api(r) else r.get("outboundTag")),
-              "bittorrent" if is_bt(r) else ("{0} customers".format(len(rule_users(r)))
-                                             if rule_users(r) else "other"))
+        b = [(("api" if is_api(r) else r.get("outboundTag")), rule_label(r))
              for r in (p["xray_before"].get("routing") or {}).get("rules", [])]
-        a = [(("api" if is_api(r) else r.get("outboundTag")),
-              "bittorrent" if is_bt(r) else ("{0} customers".format(len(rule_users(r)))
-                                             if rule_users(r) else "other"))
+        a = [(("api" if is_api(r) else r.get("outboundTag")), rule_label(r))
              for r in p["xray_after"]["routing"]["rules"]]
         if b != a:
             print("  routing rule order")
@@ -422,6 +554,11 @@ def main():
     ap.add_argument("--show", action="store_true",
                     help="print the current sniffing and rule order, then exit")
     ap.add_argument("--db", help="path to x-ui.db if it is somewhere unusual")
+    ap.add_argument("--strict", action="store_true",
+                    help="also block all UDP except DNS, NTP, QUIC and STUN. This is what "
+                         "stops uTP, but it breaks games and voice chat. Stays on once set")
+    ap.add_argument("--no-strict", action="store_true",
+                    help="remove the --strict UDP clamp")
     ap.add_argument("--no-restart", action="store_true", help="do not restart x-ui afterwards")
     ap.add_argument("--restore", nargs="?", const=True, metavar="BACKUP",
                     help="undo, using the newest backup or one you name")
@@ -441,7 +578,7 @@ def main():
         sys.exit("--apply needs root: sudo python3 block-torrents.py --apply")
 
     print("Reading {0}".format(db))
-    p = plan(db)
+    p = plan(db, strict=args.strict, drop_strict=args.no_strict)
 
     if not p["problems"]:
         print("\nTorrents are already blocked properly. Nothing to do.")
@@ -469,10 +606,16 @@ def main():
 
     print("\nApplying:")
     apply_plan(p, do_restart=not args.no_restart)
-    after = plan(db)
+    after = plan(db, strict=args.strict, drop_strict=args.no_strict)
     print("\nRe-checked: " + ("all clear, torrents are blocked."
                               if not after["problems"]
                               else "{0} problem(s) remain".format(len(after["problems"]))))
+    if not args.strict and not any(is_udp_clamp(r) for r in
+                                   (p["xray_after"].get("routing") or {}).get("rules", [])):
+        print("Still open: encrypted peer connections on random ports (uTP/MSE). Peer "
+              "discovery is blocked, so a new torrent should not find anyone - but an "
+              "already-connected client can keep going. --strict closes it, at the cost "
+              "of games and voice chat.")
     print("To undo:  sudo python3 block-torrents.py --restore")
     return 0
 
