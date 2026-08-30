@@ -166,6 +166,25 @@ def build_config(template, socks_port, sniffing):
              if "api" not in [str(x) for x in (r.get("inboundTag") or [])]
              and str(r.get("outboundTag")) != "api"]
 
+    # The probes necessarily talk to 127.0.0.1, so a private-IP rule would catch
+    # every one of them and report a clean sweep no matter what else is wrong.
+    # That rule protects the server's own network and has nothing to do with
+    # torrents, so take it out rather than let it answer for the rules under test.
+    kept, dropped = [], 0
+    for r in rules:
+        ips = [str(x).lower() for x in (r.get("ip") or [])]
+        only_private = bool(ips) and all(
+            i.startswith(("geoip:private", "127.", "10.", "192.168.", "::1", "fc00:",
+                          "fe80:")) or i.startswith("172.") for i in ips)
+        if only_private and not (r.get("protocol") or r.get("domain") or r.get("port")):
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        print("  (ignoring {0} private-IP rule(s): the probes use 127.0.0.1, so they "
+              "would mask everything)".format(dropped))
+    rules = kept
+
     return {
         "log": {"loglevel": "warning"},
         "dns": {"hosts": dict(FAKE_HOSTS), "servers": ["localhost"]},

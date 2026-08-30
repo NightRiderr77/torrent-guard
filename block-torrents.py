@@ -33,7 +33,7 @@ import sqlite3
 import subprocess
 import sys
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 DB_CANDIDATES = [
     "/etc/x-ui/x-ui.db",
@@ -98,6 +98,63 @@ DHT_SENTINEL = "domain:router.bittorrent.com"
 # high ports and there is no list to block. It also breaks games, voice chat and
 # anything else that needs arbitrary UDP, which is why it is off by default.
 UDP_EXCEPT_ESSENTIAL = "1-52,54-122,124-442,444-3477,3482-65535"
+
+
+# Where x-ui writes the config it is actually running. 3X-UI builds this from the
+# saved template plus the inbounds, so it is the template with the inbounds added -
+# which makes it a faithful way to recover a template that was never saved.
+GENERATED_CONFIGS = [
+    "/usr/local/x-ui/bin/config.json",
+    "/etc/x-ui/bin/config.json",
+    "/usr/local/x-ui/config.json",
+    "/opt/x-ui/bin/config.json",
+]
+
+TEMPLATE_KEY = "xrayTemplateConfig"
+
+
+def load_template(con):
+    """(xray, key, source) - the routing config to edit, however it is stored.
+
+    A fresh 3X-UI has no saved template at all: the panel shows its built-in
+    default and writes nothing until someone presses Save. The routing page looks
+    completely normal, which is why this is easy to miss.
+    """
+    row = con.execute("select value from settings where key=?", (TEMPLATE_KEY,)).fetchone()
+    if row is not None:
+        try:
+            return json.loads(row[0]), TEMPLATE_KEY, "saved"
+        except Exception:
+            pass
+
+    # Forks sometimes rename the key. Find it by shape instead of by name.
+    for key, value in con.execute("select key, value from settings"):
+        if not isinstance(value, str) or "outbounds" not in value:
+            continue
+        try:
+            cfg = json.loads(value)
+        except Exception:
+            continue
+        if isinstance(cfg, dict) and ("routing" in cfg or "outbounds" in cfg):
+            return cfg, key, "saved"
+
+    # Nothing saved. Recover the template from the running config: everything in it
+    # except the inbounds came from the template, and the api inbound belongs to it.
+    for p in GENERATED_CONFIGS:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p) as fh:
+                cfg = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(cfg, dict) or "outbounds" not in cfg:
+            continue
+        cfg["inbounds"] = [ib for ib in (cfg.get("inbounds") or [])
+                           if str(ib.get("tag")) == "api"]
+        return cfg, TEMPLATE_KEY, p
+
+    return None, TEMPLATE_KEY, None
 
 
 def find_db(explicit=None):
@@ -201,18 +258,25 @@ def plan(db_path, strict=False, drop_strict=False):
         inbound_fixes.append((ib["id"], name, json.dumps(new)))
         actions.append("turn on traffic inspection for {0}".format(name))
 
-    row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    xray, template_key, source = load_template(con)
     con.close()
 
-    if row is None:
+    if xray is None:
         return {"db": db_path, "problems": problems + [
-            "No routing configuration is saved yet, so the torrent rule cannot be placed."],
-            "actions": actions, "inbound_fixes": inbound_fixes,
+            "No routing configuration is saved, and the running config could not be read, "
+            "so the torrent rules cannot be placed."],
+            "actions": actions, "inbound_fixes": inbound_fixes, "template_key": template_key,
             "xray_before": None, "xray_after": None, "routing_note":
-            "Open the panel once, go to Xray Configs / Routing and press Save, then run "
-            "this again. That writes the routing config this script needs to edit."}
+            "Open the panel, go to Xray Configs / Routing and press Save, then run this "
+            "again. That writes the routing config this script needs to edit."}
 
-    xray = json.loads(row["value"])
+    seeded = source not in (None, "saved")
+    if seeded:
+        problems.append("Nothing is saved in Xray Configs / Routing, so the panel is running "
+                        "its built-in defaults and there is nothing for the torrent rules to "
+                        "be added to.")
+        actions.append("save the routing config the panel is already running, taken from "
+                       "{0}, and add the torrent rules to it".format(source))
     before = copy.deepcopy(xray)
     xray.setdefault("outbounds", [])
     routing = xray.setdefault("routing", {})
@@ -302,7 +366,11 @@ def plan(db_path, strict=False, drop_strict=False):
 
     return {"db": db_path, "problems": problems, "actions": actions,
             "inbound_fixes": inbound_fixes, "xray_before": before, "xray_after": xray,
-            "routing_note": None}
+            "template_key": template_key,
+            "routing_note": ("This writes the routing config for the first time. It is the "
+                             "one the panel is already running, so nothing about routing "
+                             "changes except the torrent rules - the same thing pressing "
+                             "Save in the panel would do." if seeded else None)}
 
 
 def _service(action):
@@ -374,8 +442,13 @@ def apply_plan(p, do_restart=True):
         for ib_id, name, sniff_json in p["inbound_fixes"]:
             con.execute("update inbounds set sniffing=? where id=?", (sniff_json, ib_id))
         if p["xray_after"] is not None:
-            con.execute("update settings set value=? where key='xrayTemplateConfig'",
-                        (json.dumps(p["xray_after"]),))
+            # UPDATE alone silently changes nothing when the row does not exist yet,
+            # which is exactly the case on a panel where Routing was never saved.
+            key = p.get("template_key") or TEMPLATE_KEY
+            value = json.dumps(p["xray_after"])
+            if con.execute("update settings set value=? where key=?", (value, key)).rowcount == 0:
+                con.execute("insert into settings (key, value) values (?, ?)", (key, value))
+                print("  saved the routing config for the first time")
         con.commit()
     finally:
         con.close()
@@ -463,13 +536,16 @@ def show_state(db_path):
         print("  [{0}] port {1:<6} {2:<22} {3}".format(
             ib["id"], ib["port"], (ib["remark"] or ib["tag"] or "")[:22], state))
 
-    row = con.execute("select value from settings where key='xrayTemplateConfig'").fetchone()
+    xray, _key, source = load_template(con)
     con.close()
-    if row is None:
+    if xray is None:
         print("")
-        print("Routing: none saved yet.")
+        print("Routing: nothing saved, and the running config could not be read.")
         return
-    xray = json.loads(row["value"])
+    if source not in (None, "saved"):
+        print("")
+        print("Routing: nothing saved - the panel is running its built-in defaults.")
+        print("Shown below as read from {0}.".format(source))
     holes = [str(o.get("tag")) for o in xray.get("outbounds", [])
              if str(o.get("protocol", "")).lower() == "blackhole"]
     print("")
@@ -610,8 +686,8 @@ def main():
     print("\nRe-checked: " + ("all clear, torrents are blocked."
                               if not after["problems"]
                               else "{0} problem(s) remain".format(len(after["problems"]))))
-    if not args.strict and not any(is_udp_clamp(r) for r in
-                                   (p["xray_after"].get("routing") or {}).get("rules", [])):
+    placed = ((p["xray_after"] or {}).get("routing") or {}).get("rules", [])
+    if not args.strict and not any(is_udp_clamp(r) for r in placed):
         print("Still open: encrypted peer connections on random ports (uTP/MSE). Peer "
               "discovery is blocked, so a new torrent should not find anyone - but an "
               "already-connected client can keep going. --strict closes it, at the cost "
