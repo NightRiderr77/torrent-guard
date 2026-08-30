@@ -103,43 +103,84 @@ The tracker hostname patterns are anchored at the start of a label on purpose. `
 ### Blocking discovery is not enough on its own
 
 Cutting off discovery stops a **new** torrent: no tracker, no DHT, no peer list.
-It does **not** stop a client that is already running. uTorrent and qBittorrent
-keep a warm DHT node cache and a peer list on disk, so they never need to look
-anything up again — they go straight to peers on random high UDP ports, and no
-routing rule can tell that traffic from any other UDP.
+It does **not** stop a client already running. uTorrent and qBittorrent keep a
+warm DHT node cache and a peer list on disk, so they never look anything up
+again — they go straight to peers on random high UDP ports, encrypted. Nothing in
+a routing table can tell that apart from any other UDP.
 
-If torrents keep running after `--apply`, this is why. Closing UDP is what stops it:
+If torrents keep going after `--apply`, this is why. There are two ways to finish
+the job, and the first is much less disruptive.
+
+## 1. Cut off the customer, not the packet — recommended
+
+You never have to identify the encrypted flow. You only have to identify the
+**person**, once. Every rule above now sends torrent traffic to its own `TORRENT`
+blackhole rather than the shared one, and Xray writes a line naming the customer
+each time it fires:
+
+```
+from tcp:203.0.113.9:51413 accepted tcp:1.2.3.4:6881 [in-443 >> TORRENT] email: bob@x.com
+```
+
+`torrent-watch.py` tails that log and drops the offender's IP in the firewall for
+a while. Their torrent client dies instantly — encrypted, µTP, DHT, all of it,
+because the whole address is gone. Every other customer is untouched, and voice,
+games and QUIC keep working normally.
+
+```bash
+sudo python3 extras/torrent-watch.py --install   # runs as a systemd service
+sudo python3 extras/torrent-watch.py --status    # who is blocked right now
+sudo python3 extras/torrent-watch.py --unblock 203.0.113.9
+```
+
+Default block is 30 minutes (`--minutes`), and it extends while they keep trying.
+It uses nftables where available and iptables otherwise, handles IPv4 and IPv6,
+and kills existing connections with `conntrack` — a new firewall rule alone would
+leave established torrent connections running until they time out. Your own SSH
+address is never blocked.
+
+> Credit where it is due: this approach is
+> [kutovoys/xray-torrent-blocker](https://github.com/kutovoys/xray-torrent-blocker),
+> a maintained Go daemon that does the same thing with webhooks, panel
+> integrations and Telegram alerts. If you would rather run that, these rules are
+> already compatible — it looks for exactly this `TORRENT` tag. The Python version
+> here exists so the whole thing stays dependency-free next to `block-torrents.py`.
+> One difference worth knowing: it tags only `protocol: bittorrent`, which sees
+> plaintext TCP alone. The tracker, DHT and port rules installed here trip on far
+> more, so the offender is caught sooner.
+
+## 2. Close UDP outright — blunter
 
 ```bash
 sudo python3 block-torrents.py --strict --apply
 ```
 
-`--strict` blocks UDP everywhere except:
+This blocks UDP everywhere except:
 
 | Allowed | Why |
 | :-- | :-- |
 | ports `53, 123, 443, 3478-3481, 19302-19309` | DNS, NTP, QUIC/HTTP3, STUN/TURN, Google's STUN range |
-| any port to `66.22.192.0/18` | Discord voice (the range is registered to Discord Inc.) |
+| Discord's allocation and i3D.net's announced space | voice chat |
 
-Voice chat is the awkward case: it picks a random high port per call, exactly
-like a torrent peer, so no port rule can separate them — but the **destination**
-can. That is why the allowlist is by address, and why Discord keeps working while
-uTP does not.
+Voice is the awkward case: a call picks a random high port, exactly like a torrent
+peer, so no port rule can separate them — but the **destination** can. Discord's
+voice servers are not in one tidy block: they run on i3D.net (AS49544), whose
+prefixes cover Singapore and India, which is what customers in Asia actually
+reach. Allowing only Discord's US range is not enough.
 
-Anything else that needs arbitrary UDP — a game, a softphone, another voice
-service — needs adding:
+Anything else needing arbitrary UDP — a game, a softphone — has to be added:
 
 ```bash
-sudo python3 block-torrents.py --strict --allow-udp-ip 66.22.192.0/18,1.2.3.0/24 --apply
-sudo python3 block-torrents.py --strict --allow-udp-port 53,123,443,3478-3481,27015-27050 --apply
+sudo python3 block-torrents.py --strict --allow-udp-ip 1.2.3.0/24 --apply
+sudo python3 block-torrents.py --strict --allow-udp-port 27015-27050 --apply
 ```
 
-Both lists are written into ordinary routing rules, so they are visible and
-editable in the panel, and a later run keeps whatever you changed there. Once
-`--strict` is on it stays on; `--no-strict` removes it.
+Both lists become ordinary routing rules, visible and editable in the panel, and a
+later run keeps whatever you changed there. Once `--strict` is on it stays on;
+`--no-strict` removes it.
 
-The one thing still open either way: an **encrypted peer on an allowed
-destination**. Nothing in Xray can distinguish that from ordinary traffic.
+Expect complaints about games. Option 1 has none of this cost, which is why it is
+the better answer for most people.
 
 ## Proving it
 
@@ -188,7 +229,7 @@ Backups are taken with SQLite's own backup API and verified before `--apply` wri
 sudo python3 block-torrents.py                  # look only (default)
 sudo python3 block-torrents.py --show           # print current state, no verdict
 sudo python3 block-torrents.py --apply          # fix it
-sudo python3 block-torrents.py --strict         # close UDP; what actually stops uTP
+sudo python3 block-torrents.py --strict         # close UDP (see option 2)
 sudo python3 block-torrents.py --no-strict      # remove the UDP clamp
 sudo python3 block-torrents.py --strict --allow-udp-ip  CIDR,...   # widen by destination
 sudo python3 block-torrents.py --strict --allow-udp-port PORTS     # widen by port
@@ -201,9 +242,14 @@ Safe to run twice — if everything is already correct it says so and exits with
 
 ## What it still can't do
 
-- **It only covers traffic through your VPN.** If a customer's own network reaches a peer directly — over IPv6 that never entered the tunnel, for instance — nothing here sees it. This is not a copyright enforcement system.
-- **A determined customer can use a private tracker over HTTPS on port 443** and hand-configure peers. Discovery blocking raises the effort a long way; it does not make torrenting impossible.
-- `extras/nft-bittorrent.sh` closes well-known tracker and DHT ports with nftables. It overlaps with what the routing rules now do and is kept as a second layer, not the control.
+- **An encrypted peer on an allowed destination.** With `--strict`, traffic to an
+  allowlisted range on any port is waved through, and nothing in Xray can tell an
+  encrypted peer from a voice call. Option 1 catches it anyway, because the client
+  trips a tracker or DHT rule long before that and loses its whole address.
+- **Traffic that never enters the tunnel.** If a customer's own ISP gives them
+  IPv6 and their client is not routing it through the VPN, none of this sees it.
+  That is a client-side problem, not a server one.
+- This is not a copyright enforcement system. It stops torrents on your servers.
 
 ## Optional: checking many panels at once
 

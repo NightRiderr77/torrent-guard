@@ -59,11 +59,28 @@ def first_existing(paths, what):
 
 
 def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """A port free for BOTH TCP and UDP.
+
+    The socks inbound and the probe listener each need the pair. Testing only TCP
+    picks a port that Xray then fails to bind for UDP, and the whole run dies with
+    a bind error that looks like a config fault.
+    """
+    for _ in range(60):
+        # Ask the OS for a UDP port first: UDP is the fussier of the two, because
+        # Windows and Hyper-V reserve wide swathes of the ephemeral range for it.
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("127.0.0.1", 0))
+        port = u.getsockname()[1]
+        u.close()
+        t = socket.socket()
+        try:
+            t.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            t.close()
+    sys.exit("could not find a port free for both TCP and UDP")
 
 
 def tcp_listener(port):
@@ -314,10 +331,13 @@ def main():
                           for r in (cfg.get("routing") or {}).get("rules", []))
             print("{0} case(s) wrong.".format(failures))
             if not clamped:
-                print("A client with a warm peer cache does not need a tracker or the "
-                      "DHT, so blocking discovery alone will not stop one already "
-                      "running. Closing UDP is what stops it:")
-                print("  sudo python3 block-torrents.py --strict --apply")
+                print("A client with a warm peer cache needs neither a tracker nor the "
+                      "DHT, so blocking discovery does not stop one already running.")
+                print("Two ways to finish it:")
+                print("  sudo python3 extras/torrent-watch.py --install   "
+                      "# cut off whoever trips the rules; nothing else affected")
+                print("  sudo python3 block-torrents.py --strict --apply  "
+                      "# close UDP; needs an allowlist for voice and games")
             else:
                 print("  sudo python3 block-torrents.py --apply")
         else:

@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # routeOnly keeps the original destination and uses the sniffed result purely for
 # routing decisions. That matters: plain destOverride rewrites the destination to
@@ -87,10 +87,34 @@ DHT_SENTINEL = "domain:router.bittorrent.com"
 # back the few things that genuinely need it.
 ESSENTIAL_UDP_PORTS = "53,123,443,3478-3481,19302-19309"
 
-# Destinations allowed on any UDP port. Voice chat picks a random high port per
-# call, exactly like a torrent peer does, so port rules cannot tell them apart -
-# but the destination can. 66.22.192.0/18 is Discord Inc. (RIPE US-DISCORD1).
-ALLOW_UDP_IPS = ["66.22.192.0/18"]
+# Discord's voice servers do not live in one tidy range. They are hosted on
+# i3D.net (AS49544), which announces 67 prefixes worldwide - and the ones a
+# customer in Asia actually reaches are the Singapore and India blocks, not the
+# US one. Allowing a single range is why voice still broke.
+#
+# AS49544's announced IPv4 space, collapsed, as of 2026-08-30. Refresh with:
+#   curl -s "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS49544"
+# i3D also host game servers, so this doubles as an allowlist for those.
+ALLOW_UDP_IPS = [
+    "5.180.216.0/22", "5.200.0.0/19", "31.204.128.0/19",
+    "43.239.136.0/22", "45.147.87.0/24", "45.149.251.0/24",
+    "45.153.18.0/23", "66.22.192.0/18", "89.104.160.0/20",
+    "89.104.176.0/22", "89.104.180.0/23", "91.195.234.0/23",
+    "91.216.207.0/24", "91.221.208.0/24", "91.233.67.0/24",
+    "103.159.122.0/23", "103.194.164.0/22", "104.153.84.0/22",
+    "109.200.192.0/19", "130.254.64.0/19", "138.128.136.0/21",
+    "146.247.72.0/22", "162.244.52.0/22", "162.245.204.0/22",
+    "185.38.20.0/22", "185.41.140.0/22", "185.50.104.0/22",
+    "185.52.12.0/22", "185.77.208.0/22", "185.162.56.0/22",
+    "185.171.240.0/22", "185.172.132.0/22", "185.179.200.0/22",
+    "185.185.212.0/22", "185.191.240.0/22", "185.197.24.0/22",
+    "185.218.164.0/23", "185.218.166.0/24", "188.122.64.0/19",
+    "193.43.218.0/24", "194.2.155.0/24", "194.61.59.0/24",
+    "194.169.249.0/24", "195.22.144.0/23", "195.85.225.0/24",
+    "199.27.212.0/22", "202.59.232.0/23", "203.132.16.0/20",
+    "212.19.224.0/22", "212.104.192.0/20", "213.163.64.0/19",
+    "213.179.192.0/19", "213.190.22.0/24", "216.98.48.0/20",
+]
 
 
 def parse_ports(spec):
@@ -124,6 +148,15 @@ def complement_ports(allowed):
     if cur <= 65535:
         out.append((cur, 65535))
     return ",".join("{0}-{1}".format(a, b) if a != b else str(a) for a, b in out)
+
+# Torrent traffic goes to its own blackhole rather than the shared "blocked" one.
+# Dropping it is identical either way - the point is the access log, which records
+# the outbound each connection took. With its own tag, every torrent attempt
+# becomes a line naming the customer, and a watcher can cut that customer off.
+# That is the only thing that reliably stops an encrypted uTP flow, because you
+# never have to identify the flow - only the person. See extras/torrent-watch.py.
+TORRENT_TAG = "TORRENT"
+ACCESS_LOG = "/usr/local/x-ui/access.log"
 
 OK, WARN, BAD = "ok", "warn", "bad"
 
@@ -254,6 +287,25 @@ def audit(xray, inbounds, strict=False):
             "fix": 'add {"tag": "blocked", "protocol": "blackhole"}',
         })
 
+    if not any(str(o.get("tag")) == TORRENT_TAG
+               and str(o.get("protocol", "")).lower() == "blackhole"
+               for o in (xray.get("outbounds") or [])):
+        findings.append({
+            "code": "no-torrent-outbound", "severity": BAD, "where": "outbounds",
+            "detail": "torrent traffic has no outbound of its own, so the access log "
+                      "cannot say which customer caused it",
+            "fix": 'add {"tag": "%s", "protocol": "blackhole"}' % TORRENT_TAG,
+        })
+
+    _access = str(((xray.get("log") or {}).get("access")) or "")
+    if not _access or _access.lower() == "none":
+        findings.append({
+            "code": "no-access-log", "severity": BAD, "where": "log.access",
+            "detail": "Xray writes no access log, so there is no way to tell which "
+                      "customer is torrenting",
+            "fix": "set log.access to {0}".format(ACCESS_LOG),
+        })
+
     # --- peer discovery ----------------------------------------------------- #
     # These come first because they hold whether or not a bittorrent rule exists,
     # and the check below returns early when it does not.
@@ -344,16 +396,19 @@ def repair_xray(xray, strict=False, drop_strict=False, allow_ips=None,
     x.setdefault("routing", {}).setdefault("rules", [])
     rules = x["routing"]["rules"]
 
-    holes = blackhole_tags(x)
-    if not holes:
-        tag = "blocked"
-        existing = set(str(o.get("tag")) for o in x["outbounds"])
-        while tag in existing:
-            tag += "_bh"
-        x["outbounds"].append({"tag": tag, "protocol": "blackhole", "settings": {}})
-        holes = [tag]
-        changes.append("added blackhole outbound {0!r}".format(tag))
-    hole = holes[0]
+    hole = TORRENT_TAG
+    if not any(str(o.get("tag")) == TORRENT_TAG
+               and str(o.get("protocol", "")).lower() == "blackhole"
+               for o in x["outbounds"]):
+        x["outbounds"].append({"tag": TORRENT_TAG, "protocol": "blackhole",
+                               "settings": {}})
+        changes.append("added blackhole outbound {0!r}".format(TORRENT_TAG))
+
+    logcfg = x.setdefault("log", {})
+    access = str(logcfg.get("access") or "")
+    if not access or access.lower() == "none":
+        logcfg["access"] = ACCESS_LOG
+        changes.append("turned on the access log at {0}".format(ACCESS_LOG))
 
     # Everything this tool owns comes out, is rebuilt correctly, and goes back as
     # one block above the customer rules. Rebuilding beats patching in place: one

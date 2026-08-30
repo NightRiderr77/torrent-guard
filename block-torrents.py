@@ -33,7 +33,7 @@ import sqlite3
 import subprocess
 import sys
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 DB_CANDIDATES = [
     "/etc/x-ui/x-ui.db",
@@ -103,11 +103,34 @@ DHT_SENTINEL = "domain:router.bittorrent.com"
 # and Meet use to find a path).
 ESSENTIAL_UDP_PORTS = "53,123,443,3478-3481,19302-19309"
 
-# Destinations allowed on any UDP port. Voice chat picks a random high port per
-# call, exactly like a torrent peer does, so port rules cannot tell them apart -
-# but the destination can. 66.22.192.0/18 is Discord Inc. (RIPE US-DISCORD1),
-# which is where their voice servers live.
-ALLOW_UDP_IPS = ["66.22.192.0/18"]
+# Discord's voice servers do not live in one tidy range. They are hosted on
+# i3D.net (AS49544), which announces 67 prefixes worldwide - and the ones a
+# customer in Asia actually reaches are the Singapore and India blocks, not the
+# US one. Allowing a single range is why voice still broke.
+#
+# AS49544's announced IPv4 space, collapsed, as of 2026-08-30. Refresh with:
+#   curl -s "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS49544"
+# i3D also host game servers, so this doubles as an allowlist for those.
+ALLOW_UDP_IPS = [
+    "5.180.216.0/22", "5.200.0.0/19", "31.204.128.0/19",
+    "43.239.136.0/22", "45.147.87.0/24", "45.149.251.0/24",
+    "45.153.18.0/23", "66.22.192.0/18", "89.104.160.0/20",
+    "89.104.176.0/22", "89.104.180.0/23", "91.195.234.0/23",
+    "91.216.207.0/24", "91.221.208.0/24", "91.233.67.0/24",
+    "103.159.122.0/23", "103.194.164.0/22", "104.153.84.0/22",
+    "109.200.192.0/19", "130.254.64.0/19", "138.128.136.0/21",
+    "146.247.72.0/22", "162.244.52.0/22", "162.245.204.0/22",
+    "185.38.20.0/22", "185.41.140.0/22", "185.50.104.0/22",
+    "185.52.12.0/22", "185.77.208.0/22", "185.162.56.0/22",
+    "185.171.240.0/22", "185.172.132.0/22", "185.179.200.0/22",
+    "185.185.212.0/22", "185.191.240.0/22", "185.197.24.0/22",
+    "185.218.164.0/23", "185.218.166.0/24", "188.122.64.0/19",
+    "193.43.218.0/24", "194.2.155.0/24", "194.61.59.0/24",
+    "194.169.249.0/24", "195.22.144.0/23", "195.85.225.0/24",
+    "199.27.212.0/22", "202.59.232.0/23", "203.132.16.0/20",
+    "212.19.224.0/22", "212.104.192.0/20", "213.163.64.0/19",
+    "213.179.192.0/19", "213.190.22.0/24", "216.98.48.0/20",
+]
 
 
 def parse_ports(spec):
@@ -159,6 +182,15 @@ GENERATED_CONFIGS = [
 ]
 
 TEMPLATE_KEY = "xrayTemplateConfig"
+
+# Torrent traffic goes to its own blackhole rather than the shared "blocked" one.
+# Dropping it is identical either way - the point is the access log, which records
+# the outbound each connection took. With its own tag, every torrent attempt
+# becomes a line naming the customer who made it, and a watcher can cut that
+# customer off entirely. That is the only thing that reliably stops an encrypted
+# uTP flow, because you never have to identify the flow - only the person.
+TORRENT_TAG = "TORRENT"
+ACCESS_LOG = "/usr/local/x-ui/access.log"
 
 
 def load_template(con):
@@ -348,14 +380,25 @@ def plan(db_path, strict=False, drop_strict=False, allow_ips=None,
     routing = xray.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
 
-    holes = [str(o.get("tag")) for o in xray["outbounds"]
-             if str(o.get("protocol", "")).lower() == "blackhole" and o.get("tag")]
-    if not holes:
-        xray["outbounds"].append({"tag": "blocked", "protocol": "blackhole", "settings": {}})
-        holes = ["blocked"]
-        problems.append("There is no blackhole outbound, so there is nowhere to drop torrents.")
-        actions.append("add a blackhole outbound called 'blocked'")
-    hole = holes[0]
+    hole = TORRENT_TAG
+    if not any(str(o.get("tag")) == TORRENT_TAG
+               and str(o.get("protocol", "")).lower() == "blackhole"
+               for o in xray["outbounds"]):
+        xray["outbounds"].append({"tag": TORRENT_TAG, "protocol": "blackhole",
+                                  "settings": {}})
+        problems.append("Torrent traffic has nowhere of its own to go, so it cannot be "
+                        "told apart from anything else that is blocked.")
+        actions.append("add a blackhole outbound tagged '{0}'".format(TORRENT_TAG))
+
+    # No access log means no way to see WHICH customer is torrenting, which is the
+    # whole basis of cutting one off.
+    logcfg = xray.setdefault("log", {})
+    access = str(logcfg.get("access") or "")
+    if not access or access.lower() == "none":
+        logcfg["access"] = ACCESS_LOG
+        problems.append("Xray writes no access log, so there is no way to tell which "
+                        "customer is torrenting.")
+        actions.append("write the access log to {0}".format(ACCESS_LOG))
 
     # Everything this tool owns comes out, is rebuilt correctly, and goes back as one
     # block above the customer rules. Rebuilding beats patching in place: there is
@@ -795,11 +838,20 @@ def main():
                               if not after["problems"]
                               else "{0} problem(s) remain".format(len(after["problems"]))))
     placed = ((p["xray_after"] or {}).get("routing") or {}).get("rules", [])
-    if not args.strict and not any(is_udp_clamp(r) for r in placed):
-        print("Still open: encrypted peer connections on random ports (uTP/MSE). Peer "
-              "discovery is blocked, so a new torrent should not find anyone - but an "
-              "already-connected client can keep going. --strict closes it, at the cost "
-              "of games and voice chat.")
+    if not any(is_udp_clamp(r) for r in placed):
+        access = (((p["xray_after"] or {}).get("log") or {}).get("access")) or ACCESS_LOG
+        print("")
+        print("These rules drop torrent traffic, but a client that already knows its peers")
+        print("keeps trying over encrypted UDP on random ports, and no rule can pick that")
+        print("out of ordinary traffic. Two ways to finish the job:")
+        print("")
+        print("  1. Cut the customer off when they are caught. Every attempt above is now")
+        print("     logged against their name in {0}.".format(access))
+        print("       sudo python3 extras/torrent-watch.py --install")
+        print("     Nothing else is affected - voice, games and QUIC keep working.")
+        print("")
+        print("  2. Close UDP outright:  --strict")
+        print("     Blunter, and it needs an allowlist for anything using arbitrary UDP.")
     print("To undo:  sudo python3 block-torrents.py --restore")
     return 0
 
